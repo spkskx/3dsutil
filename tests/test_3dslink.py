@@ -64,7 +64,7 @@ class ParseArgsTests(unittest.TestCase):
 
     def test_parse_args_accepts_explicit_ftp_defaults(self):
         args = three_dslink.parse_args([
-            "ftp",
+            "ftp", "upload",
             "--source", "sample-app.3dsx",
             "--dest", "/3ds/",
             "--unarchive",
@@ -84,6 +84,26 @@ class ParseArgsTests(unittest.TestCase):
         self.assertTrue(args.unarchive)
         self.assertEqual(args.patterns, ["*.nds", "*.gba"])
 
+    def test_parse_args_ftp_defaults_to_explorer(self):
+        args = three_dslink.parse_args(["ftp", "--host", "192.168.0.10"])
+
+        self.assertEqual(args.command, three_dslink.FTP_COMMAND)
+        self.assertEqual(args.action, three_dslink.EXPLORER_ACTION)
+        self.assertFalse(args.legacy)
+        self.assertEqual(args.host, "192.168.0.10")
+        self.assertEqual(args.port, three_dslink.DEFAULT_FTP_PORT)
+        self.assertEqual(args.user, "anonymous")
+        self.assertEqual(args.password, "")
+
+    def test_parse_args_accepts_explicit_ftp_explorer(self):
+        args = three_dslink.parse_args(["ftp", "explorer", "--host", "192.168.0.10", "--port", "6000"])
+
+        self.assertEqual(args.command, three_dslink.FTP_COMMAND)
+        self.assertEqual(args.action, three_dslink.EXPLORER_ACTION)
+        self.assertFalse(args.legacy)
+        self.assertEqual(args.host, "192.168.0.10")
+        self.assertEqual(args.port, 6000)
+
     def test_parse_args_accepts_explicit_ftp_upload(self):
         args = three_dslink.parse_args([
             "ftp", "upload", "--host", "192.168.0.10", "--source", "sample-app.3dsx", "--dest", "/3ds/"
@@ -102,7 +122,7 @@ class ParseArgsTests(unittest.TestCase):
 
     def test_parse_args_rejects_invalid_ftp_port(self):
         with self.assertRaises(SystemExit):
-            three_dslink.parse_args(["ftp", "--port", "70000", "--source", "sample-app.3dsx", "--dest", "/3ds/"])
+            three_dslink.parse_args(["ftp", "--port", "70000"])
 
     def test_parse_args_accepts_explicit_netloader_status(self):
         args = three_dslink.parse_args(["netloader", "status", "--host", "192.168.0.10", "--port", "1234"])
@@ -502,6 +522,128 @@ class FTPTransferTests(unittest.TestCase):
             with self.assertRaises(three_dslink.FTPTransferError):
                 three_dslink.unarchive_ftp_source(archive_path, extract_dir)
 
+    def test_list_ftp_directory_uses_mlsd_and_sorts_directories_first(self):
+        ftp = mock.MagicMock()
+        ftp.pwd.return_value = "/"
+        ftp.mlsd.return_value = [
+            ("game.nds", {"type": "file", "size": "1024", "modify": "20260502120000"}),
+            ("3ds", {"type": "dir", "modify": "20260501120000"}),
+        ]
+
+        entries = three_dslink.list_ftp_directory(ftp, "/")
+
+        self.assertEqual([entry["name"] for entry in entries], ["..", "3ds", "game.nds"])
+        self.assertEqual(entries[1]["type"], "dir")
+        self.assertEqual(entries[2]["size"], "1024")
+        ftp.cwd.assert_any_call("/")
+
+    def test_format_size_uses_binary_units(self):
+        self.assertEqual(three_dslink.format_size("1536"), "1.5 KiB")
+
+    def test_join_ftp_explorer_path_goes_up_from_nested_dir(self):
+        self.assertEqual(three_dslink.join_ftp_explorer_path("/roms/gba", ".."), "/roms")
+        self.assertEqual(three_dslink.join_ftp_explorer_path("/", ".."), "/")
+
+    def test_ftp_entry_display_name_explains_parent_directory(self):
+        self.assertEqual(
+            three_dslink.ftp_entry_display_name({"name": "..", "type": "dir"}),
+            ".. (go up)",
+        )
+        self.assertEqual(
+            three_dslink.ftp_entry_display_name({"name": "roms", "type": "dir"}),
+            "roms",
+        )
+
+    def test_move_ftp_selection_selects_previous_and_current_entries(self):
+        entries = [
+            {"name": "..", "type": "dir"},
+            {"name": "first.nds", "type": "file"},
+            {"name": "second.nds", "type": "file"},
+        ]
+
+        selected, selected_paths = three_dslink.move_ftp_selection("/roms", entries, 1, set(), 1)
+
+        self.assertEqual(selected, 2)
+        self.assertEqual(selected_paths, {"/roms/first.nds", "/roms/second.nds"})
+
+    def test_restored_ftp_selection_selects_returned_directory(self):
+        entries = [
+            {"name": "..", "type": "dir"},
+            {"name": "gba", "type": "dir"},
+            {"name": "nds", "type": "dir"},
+        ]
+
+        self.assertEqual(three_dslink.restored_ftp_selection(entries, "nds", 0), 2)
+        self.assertEqual(three_dslink.restored_ftp_selection(entries, "missing", 1), 1)
+
+    def test_move_ftp_paths_renames_items_into_destination_directory(self):
+        ftp = mock.MagicMock()
+        items = [
+            ("/roms/game.nds", {"name": "game.nds", "type": "file"}),
+            ("/roms/saves", {"name": "saves", "type": "dir"}),
+        ]
+
+        moved = three_dslink.move_ftp_paths(ftp, items, "/archive")
+
+        self.assertEqual(
+            moved,
+            [
+                ("/roms/game.nds", "/archive/game.nds"),
+                ("/roms/saves", "/archive/saves"),
+            ],
+        )
+        ftp.rename.assert_has_calls([
+            mock.call("/roms/game.nds", "/archive/game.nds"),
+            mock.call("/roms/saves", "/archive/saves"),
+        ])
+
+    def test_move_ftp_paths_rejects_moving_directory_into_itself(self):
+        ftp = mock.MagicMock()
+
+        with self.assertRaises(three_dslink.FTPTransferError):
+            three_dslink.move_ftp_paths(
+                ftp,
+                [("/roms", {"name": "roms", "type": "dir"})],
+                "/roms/nested",
+            )
+
+    def test_delete_ftp_path_deletes_files_directly(self):
+        ftp = mock.MagicMock()
+
+        three_dslink.delete_ftp_path(ftp, "/roms/game.nds", "file")
+
+        ftp.delete.assert_called_once_with("/roms/game.nds")
+        ftp.rmd.assert_not_called()
+
+    def test_delete_ftp_path_deletes_directory_recursively(self):
+        ftp = mock.MagicMock()
+
+        def fake_list(_ftp, path):
+            if path == "/roms":
+                return [
+                    {"name": "..", "type": "dir", "size": None, "modify": None},
+                    {"name": "game.nds", "type": "file", "size": "1", "modify": None},
+                    {"name": "nested", "type": "dir", "size": None, "modify": None},
+                ]
+            if path == "/roms/nested":
+                return [
+                    {"name": "..", "type": "dir", "size": None, "modify": None},
+                    {"name": "save.sav", "type": "file", "size": "1", "modify": None},
+                ]
+            return [{"name": "..", "type": "dir", "size": None, "modify": None}]
+
+        with mock.patch.object(three_dslink, "list_ftp_directory", side_effect=fake_list):
+            three_dslink.delete_ftp_path(ftp, "/roms", "dir")
+
+        ftp.delete.assert_has_calls([
+            mock.call("/roms/game.nds"),
+            mock.call("/roms/nested/save.sav"),
+        ])
+        ftp.rmd.assert_has_calls([
+            mock.call("/roms/nested"),
+            mock.call("/roms"),
+        ])
+
 
 class FTPHostResolutionTests(unittest.TestCase):
     def test_resolve_ftp_host_uses_single_mdns_candidate(self):
@@ -671,6 +813,7 @@ class MainTests(unittest.TestCase):
     def test_main_runs_ftp_command(self):
         args = argparse.Namespace(
             command=three_dslink.FTP_COMMAND,
+            action=three_dslink.UPLOAD_ACTION,
             legacy=False,
             source=["sample-app.3dsx"],
             dest="/3ds/",
@@ -684,10 +827,28 @@ class MainTests(unittest.TestCase):
 
         with mock.patch.object(three_dslink, "parse_args", return_value=args), \
             mock.patch.object(three_dslink, "run_ftp") as run_mock:
-            result = three_dslink.main(["ftp", "--host", "192.168.0.10", "--source", "sample-app.3dsx", "--dest", "/3ds/"])
+            result = three_dslink.main(["ftp", "upload", "--host", "192.168.0.10", "--source", "sample-app.3dsx", "--dest", "/3ds/"])
 
         self.assertEqual(result, 0)
         run_mock.assert_called_once_with(args)
+
+    def test_main_runs_ftp_explorer_command(self):
+        args = argparse.Namespace(
+            command=three_dslink.FTP_COMMAND,
+            action=three_dslink.EXPLORER_ACTION,
+            legacy=False,
+            host="192.168.0.10",
+            port=5000,
+            user="anonymous",
+            password="",
+        )
+
+        with mock.patch.object(three_dslink, "parse_args", return_value=args), \
+            mock.patch.object(three_dslink, "run_ftp_explorer") as explorer_mock:
+            result = three_dslink.main(["ftp", "--host", "192.168.0.10"])
+
+        self.assertEqual(result, 0)
+        explorer_mock.assert_called_once_with(args)
 
     def test_run_ftp_unarchives_before_uploading(self):
         args = argparse.Namespace(

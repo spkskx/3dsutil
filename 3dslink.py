@@ -1,4 +1,5 @@
 import argparse
+import curses
 import fnmatch
 import ftplib
 import os
@@ -17,6 +18,7 @@ FTP_COMMAND = "ftp"
 STATUS_ACTION = "status"
 LOAD_ACTION = "load"
 UPLOAD_ACTION = "upload"
+EXPLORER_ACTION = "explorer"
 DEFAULT_NETLOADER_PORT = 17491
 DEFAULT_FTP_PORT = 5000
 DEFAULT_PORT = DEFAULT_NETLOADER_PORT
@@ -764,6 +766,469 @@ def check_ftp_status(host, port, user, password):
     print(f"FTP is reachable at {host}:{port}")
 
 
+def parse_ftp_modify_time(value):
+    if not value:
+        return None
+    if len(value) < 14 or not value[:14].isdigit():
+        return value
+    return f"{value[0:4]}-{value[4:6]}-{value[6:8]} {value[8:10]}:{value[10:12]}:{value[12:14]} UTC"
+
+
+def format_size(size):
+    if size is None:
+        return ""
+    try:
+        value = int(size)
+    except (TypeError, ValueError):
+        return str(size)
+
+    units = ("B", "KiB", "MiB", "GiB")
+    amount = float(value)
+    for unit in units:
+        if amount < 1024 or unit == units[-1]:
+            if unit == "B":
+                return f"{value} {unit}"
+            return f"{amount:.1f} {unit}"
+        amount /= 1024
+    return f"{value} B"
+
+
+def ftp_entry_sort_key(entry):
+    return (entry["type"] != "dir", entry["name"].lower())
+
+
+def list_ftp_directory(ftp, path):
+    entries = [{"name": "..", "type": "dir", "size": None, "modify": None}]
+    original = ftp.pwd()
+    try:
+        ftp.cwd(path)
+        try:
+            raw_entries = list(ftp.mlsd())
+        except ftplib.all_errors:
+            raw_entries = [(name, {}) for name in ftp.nlst()]
+
+        for name, facts in raw_entries:
+            if name in ("", ".", ".."):
+                continue
+            entry_type = facts.get("type", "file")
+            if entry_type == "cdir":
+                continue
+            if entry_type == "pdir":
+                name = ".."
+                entry_type = "dir"
+            entries.append(
+                {
+                    "name": name,
+                    "type": "dir" if entry_type == "dir" else "file",
+                    "size": facts.get("size"),
+                    "modify": facts.get("modify"),
+                }
+            )
+    finally:
+        ftp.cwd(original)
+
+    return [entries[0]] + sorted(entries[1:], key=ftp_entry_sort_key)
+
+
+def join_ftp_explorer_path(current, name):
+    if name == "..":
+        parent = posixpath.dirname(current.rstrip("/"))
+        return parent or "/"
+    return join_remote_path(current, name)
+
+
+def ftp_entry_display_name(entry):
+    if entry["name"] == "..":
+        return ".. (go up)"
+    return entry["name"]
+
+
+def selectable_ftp_entries(current_path, entries, selected, selected_paths):
+    selected_items = []
+    by_path = {}
+    for entry in entries:
+        if entry["name"] == "..":
+            continue
+        path = join_ftp_explorer_path(current_path, entry["name"])
+        by_path[path] = entry
+        if path in selected_paths:
+            selected_items.append((path, entry))
+
+    if selected_items:
+        return selected_items
+
+    entry = entries[selected]
+    if entry["name"] == "..":
+        return []
+    path = join_ftp_explorer_path(current_path, entry["name"])
+    return [(path, entry)]
+
+
+def add_entry_to_selection(current_path, entries, selected, selected_paths):
+    entry = entries[selected]
+    if entry["name"] == "..":
+        return selected_paths
+    selected_paths.add(join_ftp_explorer_path(current_path, entry["name"]))
+    return selected_paths
+
+
+def move_ftp_selection(current_path, entries, selected, selected_paths, direction):
+    selected_paths = add_entry_to_selection(current_path, entries, selected, selected_paths)
+    selected = max(0, min(len(entries) - 1, selected + direction))
+    selected_paths = add_entry_to_selection(current_path, entries, selected, selected_paths)
+    return selected, selected_paths
+
+
+def restored_ftp_selection(entries, name, fallback):
+    if name is None:
+        return min(fallback, len(entries) - 1)
+    return next(
+        (index for index, entry in enumerate(entries) if entry["name"] == name),
+        min(fallback, len(entries) - 1),
+    )
+
+
+def delete_ftp_path(ftp, path, entry_type):
+    if entry_type != "dir":
+        ftp.delete(path)
+        return
+
+    for entry in list_ftp_directory(ftp, path):
+        if entry["name"] == "..":
+            continue
+        child_path = join_ftp_explorer_path(path, entry["name"])
+        delete_ftp_path(ftp, child_path, entry["type"])
+    ftp.rmd(path)
+
+
+def move_ftp_paths(ftp, items, destination_dir):
+    moved = []
+    destination_dir = normalize_remote_path(destination_dir)
+    for source_path, entry in items:
+        destination_path = join_remote_path(destination_dir, posixpath.basename(source_path))
+        if destination_path == source_path:
+            continue
+        if entry["type"] == "dir" and destination_path.startswith(source_path.rstrip("/") + "/"):
+            raise FTPTransferError(f"cannot move a directory into itself: {source_path}")
+        ftp.rename(source_path, destination_path)
+        moved.append((source_path, destination_path))
+    return moved
+
+
+def truncate_text(text, width):
+    if width <= 0:
+        return ""
+    if len(text) <= width:
+        return text
+    if width <= 1:
+        return text[:width]
+    return text[: width - 3] + "..." if width > 3 else text[:width]
+
+
+def draw_ftp_explorer(
+    stdscr,
+    current_path,
+    entries,
+    selected,
+    message="",
+    metadata_loading=False,
+    selected_paths=None,
+    move_buffer=None,
+):
+    selected_paths = selected_paths or set()
+    height, width = stdscr.getmaxyx()
+    if height < 4 or width < 20:
+        stdscr.erase()
+        stdscr.addnstr(0, 0, "Terminal too small", max(0, width - 1))
+        stdscr.refresh()
+        return
+
+    stdscr.erase()
+    stdscr.addnstr(0, 0, f"FTP Explorer: {current_path}", width - 1, curses.A_BOLD)
+    stdscr.addnstr(1, 0, "Up/Down/j/k move  Shift+Up/Down/J/K multi-select  Enter open/go up  Backspace up  m move  p/P paste  d delete  c/Esc cancel  q quit", width - 1)
+
+    split = max(24, width // 2)
+    list_width = min(split, width - 1)
+    detail_x = min(list_width + 2, width - 1)
+    detail_width = max(0, width - detail_x - 1)
+    visible_rows = max(1, height - 5)
+    offset = max(0, selected - visible_rows + 1)
+
+    for row, entry in enumerate(entries[offset: offset + visible_rows], start=3):
+        path = join_ftp_explorer_path(current_path, entry["name"])
+        selected_marker = "*" if path in selected_paths else " "
+        prefix = "[Dir]" if entry["type"] == "dir" else "     "
+        label = f"{selected_marker} {prefix} {ftp_entry_display_name(entry)}"
+        attr = curses.A_REVERSE if offset + row - 3 == selected else curses.A_NORMAL
+        stdscr.addnstr(row, 0, truncate_text(label, list_width - 1), list_width - 1, attr)
+
+    if entries and detail_width > 0:
+        entry = entries[selected]
+        selected_path = join_ftp_explorer_path(current_path, entry["name"])
+        size = "n/a" if entry["type"] == "dir" else format_size(entry["size"]) or "n/a"
+        details = [
+            ("Name", ftp_entry_display_name(entry)),
+            ("Type", "Directory" if entry["type"] == "dir" else "File"),
+            ("Path", selected_path),
+            ("Size", size),
+            ("Modified", parse_ftp_modify_time(entry["modify"]) or "n/a"),
+        ]
+        stdscr.addnstr(3, detail_x, "Metadata", detail_width, curses.A_BOLD)
+        if metadata_loading:
+            stdscr.addnstr(5, detail_x, "Loading...", detail_width)
+        else:
+            for index, (label, value) in enumerate(details, start=5):
+                if index >= height - 1:
+                    break
+                stdscr.addnstr(index, detail_x, truncate_text(f"{label}: {value}", detail_width), detail_width)
+
+    move_text = f"Move: {len(move_buffer)} item(s) ready. p pastes here, P pastes into selected dir, c/Esc cancels." if move_buffer else "Move: none. Press m to stage selected item(s) for moving."
+    if height > 1:
+        stdscr.addnstr(height - 2, 0, truncate_text(move_text, width - 1), width - 1, curses.A_DIM)
+    if message and height > 0:
+        stdscr.addnstr(height - 1, 0, truncate_text(message, width - 1), width - 1, curses.A_DIM)
+    stdscr.refresh()
+
+
+def prompt_ftp_confirmation(stdscr, prompt):
+    height, width = stdscr.getmaxyx()
+    if height <= 0 or width <= 0:
+        return False
+
+    lines = [prompt, "Confirm? [y/N]"]
+    box_width = min(max(32, max(len(line) for line in lines) + 4), max(1, width - 2))
+    box_height = 5
+    top = max(0, (height - box_height) // 2)
+    left = max(0, (width - box_width) // 2)
+
+    for row in range(box_height):
+        stdscr.addnstr(top + row, left, " " * box_width, box_width, curses.A_REVERSE)
+
+    stdscr.addnstr(top, left, "+" + "-" * (box_width - 2) + "+", box_width, curses.A_REVERSE)
+    for index, line in enumerate(lines, start=1):
+        text = truncate_text(line, box_width - 4)
+        stdscr.addnstr(top + index, left, f"| {text.ljust(box_width - 4)} |", box_width, curses.A_REVERSE)
+    stdscr.addnstr(top + box_height - 1, left, "+" + "-" * (box_width - 2) + "+", box_width, curses.A_REVERSE)
+    stdscr.refresh()
+
+    while True:
+        key = stdscr.getch()
+        if key in (ord("y"), ord("Y")):
+            return True
+        if key in (ord("n"), ord("N"), 27, 10, 13):
+            return False
+
+
+def ftp_explorer_loop(stdscr, ftp, start_path="/"):
+    try:
+        curses.curs_set(0)
+    except curses.error:
+        pass
+    current_path = normalize_remote_path(start_path)
+    selected = 0
+    message = ""
+    entries = [{"name": "..", "type": "dir", "size": None, "modify": None}]
+    selected_paths = set()
+    shift_selected_paths = set()
+    shift_selecting = False
+    move_buffer = []
+    restore_selection_name = None
+
+    while True:
+        draw_ftp_explorer(
+            stdscr,
+            current_path,
+            entries,
+            selected,
+            "Loading directory...",
+            metadata_loading=True,
+            selected_paths=selected_paths | shift_selected_paths,
+            move_buffer=move_buffer,
+        )
+        try:
+            entries = list_ftp_directory(ftp, current_path)
+            message = ""
+        except ftplib.all_errors as exc:
+            message = f"Could not list {current_path}: {exc}"
+            entries = [{"name": "..", "type": "dir", "size": None, "modify": None}]
+
+        if restore_selection_name is not None:
+            selected = restored_ftp_selection(entries, restore_selection_name, selected)
+            restore_selection_name = None
+        else:
+            selected = restored_ftp_selection(entries, None, selected)
+        while True:
+            draw_ftp_explorer(
+                stdscr,
+                current_path,
+                entries,
+                selected,
+                message,
+                selected_paths=selected_paths | shift_selected_paths,
+                move_buffer=move_buffer,
+            )
+            key = stdscr.getch()
+            message = ""
+
+            if key in (ord("q"), ord("Q")):
+                return
+            if key in (curses.KEY_UP, ord("k")):
+                selected = max(0, selected - 1)
+                shift_selected_paths = set()
+                shift_selecting = False
+                continue
+            if key in (curses.KEY_DOWN, ord("j")):
+                selected = min(len(entries) - 1, selected + 1)
+                shift_selected_paths = set()
+                shift_selecting = False
+                continue
+            if key in (getattr(curses, "KEY_SR", -1), ord("K")):
+                if not shift_selecting:
+                    selected_paths = set()
+                    shift_selected_paths = set()
+                    shift_selecting = True
+                selected, shift_selected_paths = move_ftp_selection(current_path, entries, selected, shift_selected_paths, -1)
+                continue
+            if key in (getattr(curses, "KEY_SF", -1), ord("J")):
+                if not shift_selecting:
+                    selected_paths = set()
+                    shift_selected_paths = set()
+                    shift_selecting = True
+                selected, shift_selected_paths = move_ftp_selection(current_path, entries, selected, shift_selected_paths, 1)
+                continue
+            if key == ord(" "):
+                entry = entries[selected]
+                if entry["name"] == "..":
+                    message = "Cannot select parent entry."
+                    continue
+                path = join_ftp_explorer_path(current_path, entry["name"])
+                if path in selected_paths:
+                    selected_paths.remove(path)
+                else:
+                    selected_paths.add(path)
+                shift_selected_paths = set()
+                shift_selecting = False
+                continue
+            if key in (ord("c"), ord("C"), 27):
+                move_buffer = []
+                message = "Move canceled."
+                continue
+            if key == ord("m"):
+                items = selectable_ftp_entries(current_path, entries, selected, selected_paths | shift_selected_paths)
+                if not items:
+                    message = "Select a file or directory to move."
+                    continue
+                move_buffer = items
+                selected_paths = set()
+                shift_selected_paths = set()
+                shift_selecting = False
+                message = f"Staged {len(move_buffer)} item(s) to move."
+                continue
+            if key in (ord("p"), ord("P")):
+                if not move_buffer:
+                    message = "No staged move. Press m first."
+                    continue
+                destination_dir = current_path
+                if key == ord("P"):
+                    entry = entries[selected]
+                    if entry["type"] == "dir" and entry["name"] != "..":
+                        destination_dir = join_ftp_explorer_path(current_path, entry["name"])
+                description = f"Move {len(move_buffer)} item(s) to {destination_dir}?"
+                if not prompt_ftp_confirmation(stdscr, description):
+                    message = "Move canceled."
+                    continue
+                try:
+                    moved = move_ftp_paths(ftp, move_buffer, destination_dir)
+                    message = f"Moved {len(moved)} item(s)."
+                    move_buffer = []
+                    selected_paths = set()
+                    shift_selected_paths = set()
+                    shift_selecting = False
+                    break
+                except ftplib.all_errors + (OSError, FTPTransferError) as exc:
+                    message = f"Move failed: {exc}"
+                    continue
+            if key == ord("d"):
+                items = selectable_ftp_entries(current_path, entries, selected, selected_paths | shift_selected_paths)
+                if not items:
+                    message = "Select a file or directory to delete."
+                    continue
+                names = ", ".join(path for path, _ in items[:3])
+                suffix = "..." if len(items) > 3 else ""
+                description = f"Delete {len(items)} item(s): {names}{suffix}?"
+                if not prompt_ftp_confirmation(stdscr, description):
+                    message = "Delete canceled."
+                    continue
+                try:
+                    for path, entry in items:
+                        delete_ftp_path(ftp, path, entry["type"])
+                    selected_paths = set()
+                    shift_selected_paths = set()
+                    shift_selecting = False
+                    move_buffer = [(path, entry) for path, entry in move_buffer if path not in {item_path for item_path, _ in items}]
+                    message = f"Deleted {len(items)} item(s)."
+                    break
+                except ftplib.all_errors + (OSError,) as exc:
+                    message = f"Delete failed: {exc}"
+                    continue
+            if key in (curses.KEY_BACKSPACE, 8, 127):
+                if current_path == "/":
+                    message = "Already at root."
+                    continue
+                previous_path = current_path
+                current_path = join_ftp_explorer_path(current_path, "..")
+                restore_selection_name = posixpath.basename(previous_path.rstrip("/"))
+                selected_paths = set()
+                shift_selected_paths = set()
+                shift_selecting = False
+                break
+            if key in (curses.KEY_ENTER, 10, 13):
+                entry = entries[selected]
+                if entry["type"] == "dir":
+                    previous_path = current_path
+                    current_path = join_ftp_explorer_path(current_path, entry["name"])
+                    if entry["name"] == "..":
+                        restore_selection_name = posixpath.basename(previous_path.rstrip("/"))
+                    else:
+                        selected = 0
+                        restore_selection_name = None
+                    selected_paths = set()
+                    shift_selected_paths = set()
+                    shift_selecting = False
+                    break
+                message = "Selected file. Use FTP upload for transfers."
+
+
+def run_ftp_explorer(args):
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        raise FTPTransferError("FTP explorer requires an interactive terminal")
+
+    host, port = resolve_ftp_host(args.host, args.port)
+    try:
+        with ftplib.FTP() as ftp:
+            ftp.connect(host, port, timeout=DEFAULT_TIMEOUT)
+            ftp.set_pasv(True)
+            ftp.login(user=args.user, passwd=args.password)
+            curses.wrapper(ftp_explorer_loop, ftp, "/")
+    except ftplib.all_errors + (OSError,) as exc:
+        raise FTPTransferError(f"FTP explorer failed for {host}:{port}: {exc}") from exc
+
+
+def add_ftp_connection_arguments(parser):
+    parser.add_argument(
+        "--host",
+        help="3DS FTP hostname or IPv4 address. If omitted, the utility tries mDNS discovery or prompts interactively.",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=DEFAULT_FTP_PORT,
+        help=f"FTP port. Default: {DEFAULT_FTP_PORT}",
+    )
+    parser.add_argument("--user", default="anonymous", help="FTP username. Default: anonymous")
+    parser.add_argument("--password", default="", help="FTP password. Default: empty")
+
+
 def add_netloader_arguments(parser):
     parser.add_argument("file", help="Path to the .3dsx file to upload")
     parser.add_argument(
@@ -791,18 +1256,7 @@ def add_ftp_arguments(parser):
         action="append",
         help="Upload only files matching a shell-style pattern, such as '*.nds' or '*.gba'. Repeat for multiple patterns.",
     )
-    parser.add_argument(
-        "--host",
-        help="3DS FTP hostname or IPv4 address. If omitted, the utility tries mDNS discovery or prompts interactively.",
-    )
-    parser.add_argument(
-        "--port",
-        type=int,
-        default=DEFAULT_FTP_PORT,
-        help=f"FTP port. Default: {DEFAULT_FTP_PORT}",
-    )
-    parser.add_argument("--user", default="anonymous", help="FTP username. Default: anonymous")
-    parser.add_argument("--password", default="", help="FTP password. Default: empty")
+    add_ftp_connection_arguments(parser)
 
 
 def add_netloader_status_arguments(parser):
@@ -819,18 +1273,7 @@ def add_netloader_status_arguments(parser):
 
 
 def add_ftp_status_arguments(parser):
-    parser.add_argument(
-        "--host",
-        help="3DS FTP hostname or IPv4 address. If omitted, the utility tries mDNS discovery or prompts interactively.",
-    )
-    parser.add_argument(
-        "--port",
-        type=int,
-        default=DEFAULT_FTP_PORT,
-        help=f"FTP port. Default: {DEFAULT_FTP_PORT}",
-    )
-    parser.add_argument("--user", default="anonymous", help="FTP username. Default: anonymous")
-    parser.add_argument("--password", default="", help="FTP password. Default: empty")
+    add_ftp_connection_arguments(parser)
 
 
 def validate_port(parser, port, option="--port"):
@@ -870,8 +1313,8 @@ def parse_args(argv):
     netloader_parser = subparsers.add_parser(NETLOADER_COMMAND, help="Upload and launch through 3dslink NetLoader")
     add_netloader_arguments(netloader_parser)
 
-    ftp_parser = subparsers.add_parser(FTP_COMMAND, help="Upload through a 3DS FTP server such as ftpd")
-    add_ftp_arguments(ftp_parser)
+    ftp_parser = subparsers.add_parser(FTP_COMMAND, help="Browse or upload through a 3DS FTP server such as ftpd")
+    add_ftp_connection_arguments(ftp_parser)
 
     if argv and argv[0] in ("-h", "--help"):
         return parser.parse_args(argv)
@@ -920,13 +1363,22 @@ def parse_args(argv):
             "Upload a file or directory through FTP.",
         )
 
+    if len(argv) >= 2 and argv[0] == FTP_COMMAND and argv[1] == EXPLORER_ACTION:
+        return parse_action_args(
+            argv[2:],
+            FTP_COMMAND,
+            EXPLORER_ACTION,
+            add_ftp_connection_arguments,
+            "Browse files and directories through FTP.",
+        )
+
     if argv and argv[0] in (NETLOADER_COMMAND, FTP_COMMAND):
         args = parser.parse_args(argv)
         validate_port(parser, args.port)
         if args.command == NETLOADER_COMMAND:
             args.action = LOAD_ACTION
         else:
-            args.action = UPLOAD_ACTION
+            args.action = EXPLORER_ACTION
         args.legacy = False
         return args
 
@@ -1030,6 +1482,8 @@ def main(argv=None):
 
         if getattr(args, "action", UPLOAD_ACTION) == STATUS_ACTION:
             run_status(args)
+        elif args.command == FTP_COMMAND and args.action == EXPLORER_ACTION:
+            run_ftp_explorer(args)
         elif args.command == FTP_COMMAND:
             run_ftp(args)
         else:

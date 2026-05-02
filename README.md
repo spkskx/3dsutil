@@ -5,7 +5,7 @@
 It supports two main workflows:
 
 - **Load and launch `.3dsx` apps through 3dslink NetLoader.** Use this when the Homebrew Launcher is open and you want to run one `.3dsx` immediately.
-- **Transfer files or directories through a 3DS FTP server such as ftpd.** Use this when you want to copy one file, rename it during upload, or sync the contents of a local directory to the SD card.
+- **Browse or transfer files through a 3DS FTP server such as ftpd.** Use `ftp` for an interactive remote file explorer, or `ftp upload` when you want to copy one file, rename it during upload, or sync the contents of a local directory to the SD card.
 
 The tool can discover NetLoader with UDP broadcast, discover FTP services with best-effort mDNS, prompt for an address in interactive terminals, or connect directly when you pass `--host`.
 
@@ -25,8 +25,9 @@ The tool can discover NetLoader with UDP broadcast, discover FTP services with b
 | Legacy NetLoader load | `FILE` | Old flat form. Still works, but prints a deprecation warning. | `python3 3dslink.py sample-app.3dsx` |
 | Check NetLoader reachability | `netloader status [--host HOST] [--port PORT]` | Checks discovery, resolution, and TCP reachability. Restart NetLoader afterward before loading. | `python3 3dslink.py netloader status --host 172.20.10.12` |
 | Default status check | `status [--host HOST] [--port PORT]` | Same as `netloader status`. | `python3 3dslink.py status --host 172.20.10.12` |
-| Upload with FTP | `ftp upload [--host HOST] [--port PORT] [--user USER] [--password PASSWORD] [--unarchive] [--patterns PATTERN] --source PATH [--source PATH ...] --dest PATH` | Uploads one or more files, directories, or archive sources. `upload` is the default FTP action. | `python3 3dslink.py ftp upload --host 192.168.0.10 --source ./3ds --dest /3ds/` |
-| Upload with FTP shorthand | `ftp [--host HOST] [--port PORT] [--user USER] [--password PASSWORD] [--unarchive] [--patterns PATTERN] --source PATH [--source PATH ...] --dest PATH` | Same as `ftp upload`. | `python3 3dslink.py ftp --host 192.168.0.10 --source app.3dsx --dest /3ds/` |
+| Browse with FTP explorer | `ftp [--host HOST] [--port PORT] [--user USER] [--password PASSWORD]` | Opens a terminal file explorer for the FTP server. `explorer` is the default FTP action. | `python3 3dslink.py ftp --host 192.168.0.10` |
+| Browse with explicit FTP explorer | `ftp explorer [--host HOST] [--port PORT] [--user USER] [--password PASSWORD]` | Same as `ftp`. | `python3 3dslink.py ftp explorer --host 192.168.0.10` |
+| Upload with FTP | `ftp upload [--host HOST] [--port PORT] [--user USER] [--password PASSWORD] [--unarchive] [--patterns PATTERN] --source PATH [--source PATH ...] --dest PATH` | Uploads one or more files, directories, or archive sources. | `python3 3dslink.py ftp upload --host 192.168.0.10 --source ./3ds --dest /3ds/` |
 | Check FTP reachability | `ftp status [--host HOST] [--port PORT] [--user USER] [--password PASSWORD]` | Connects to FTP and verifies login. | `python3 3dslink.py ftp status --host 192.168.0.10` |
 | Show help | `--help` | Shows top-level CLI help. Use subcommand help for action-specific options. | `python3 3dslink.py ftp upload --help` |
 
@@ -50,7 +51,7 @@ Typical workflow:
 
 ## FTP
 
-FTP mode is for transferring files to a 3DS FTP server such as ftpd. It does not launch apps.
+FTP mode is for browsing and transferring files on a 3DS FTP server such as ftpd. It does not launch apps.
 
 | Option | Default | Description |
 | --- | --- | --- |
@@ -62,6 +63,25 @@ FTP mode is for transferring files to a 3DS FTP server such as ftpd. It does not
 | `--password PASSWORD` | empty | FTP password. |
 | `--unarchive` | prompt when interactive | Extract `.zip` or `.7z` archives into one unique temporary directory, then upload the extracted files into `--dest`. If omitted and archives are found in an interactive terminal, the prompt defaults to yes. Answering no ignores archive files and uploads the remaining files that match `--patterns`. `.zip` uses Python's standard library; `.7z` requires a `7z` or `7zz` command in `PATH`. |
 | `--patterns PATTERN` | none | Upload only files matching a shell-style pattern, such as `*.nds` or `*.gba`. Repeat `--patterns` for multiple patterns. Filters apply after unarchiving. |
+
+FTP explorer controls:
+
+| Key | Action |
+| --- | --- |
+| `Up` / `Down` or `j` / `k` | Move the highlighted file or directory and update the metadata panel. Normal movement clears temporary multi-selection. |
+| `Shift+Up` / `Shift+Down` or `J` / `K` | Extend multi-selection while moving. |
+| `Space` | Toggle multi-select for the highlighted file or directory. |
+| `Enter` on a directory | Open the selected directory. |
+| `Enter` on `..` | Go up to the parent directory. |
+| `Backspace` | Go up to the parent directory without highlighting `..`. |
+| `m` | Stage the selected item, or all multi-selected items, for moving. |
+| `p` | Paste staged move items into the current directory after a centered y/n confirmation popup. |
+| `P` | Paste staged move items into the highlighted directory after a centered y/n confirmation popup, or into the current directory when a file is highlighted. |
+| `c` / `Esc` | Cancel the staged move. |
+| `d` | Delete the selected item, or all multi-selected items, after a centered y/n confirmation popup. Directories are deleted recursively. |
+| `q` | Quit the explorer. |
+
+The right side of the explorer shows metadata for the selected entry, including name, type, remote path, size, and modified time when the FTP server reports it. Directory size is shown as `n/a` because FTP servers do not provide a reliable whole-directory size without recursively scanning the tree. The footer always shows whether a move is staged and how to paste or cancel it.
 
 Destination behavior:
 
@@ -127,6 +147,9 @@ CI runs the same test suite on push and pull request for Python 3.11, 3.12, and 
 - Added a NetLoader status warning because checking the TCP port can require restarting NetLoader before the next load.
 - Added an interactive NetLoader prompt for `host` or `host:port` when UDP discovery fails.
 - Added FTP upload support through Python's standard-library `ftplib`, defaulting to port `5000`, passive mode, and anonymous login.
+- Changed the default `ftp` action to an interactive terminal file explorer and added explicit `ftp explorer`.
+- Added FTP explorer multi-select, move, paste, and recursive delete actions with confirmation prompts.
+- Refined FTP explorer navigation with `j`/`k`, shifted range selection, Backspace parent navigation, centered confirmation popups, and restored parent-directory selection when going back up.
 - Reworked FTP uploads to use `--source` and `--dest`, support file and directory sources, create missing destination directories, skip same-size files, rename different-size conflicts, show progress, and print a summary.
 - Added FTP `--unarchive` for `.zip` and `.7z` sources, including directory sources containing archives, and `--patterns` for shell-style upload filtering.
 - Added an interactive FTP archive prompt that defaults to extracting archives and can ignore archives while uploading the rest.
