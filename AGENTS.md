@@ -8,8 +8,11 @@ This repository is intentionally small. The main utility lives in `3dslink.py` a
 
 - `python3 3dslink.py --help`: show CLI arguments and verify the script starts.
 - `python3 3dslink.py netloader load --host 172.20.10.12 sample-app.3dsx`: send a `.3dsx` file to a known 3DS NetLoader address.
+- `python3 3dslink.py netloader load sample-app.3dsx`: auto-discover NetLoader, or prompt interactively for `host` or `host:port` if discovery fails.
 - `python3 3dslink.py netloader status --host 172.20.10.12`: check whether NetLoader is reachable. Tell users to restart NetLoader afterward by pressing `B`, then `Y` in the Homebrew Launcher.
 - `python3 3dslink.py ftp upload --host 172.20.10.12 --source sample-app.3dsx --dest /3ds/`: upload a file or directory to a 3DS FTP server such as ftpd.
+- `python3 3dslink.py ftp upload --host 172.20.10.12 --source first.nds --source second.gba --dest /roms/`: upload multiple sources in one FTP command.
+- `python3 3dslink.py ftp upload --host 172.20.10.12 --source roms.zip --dest /roms/ --unarchive --patterns "*.nds"`: extract one archive, or every archive in a directory source, to a temporary directory and upload matching extracted files into the destination root. If `--unarchive` is omitted and archives are found interactively, the prompt defaults to yes; answering no ignores archives and uploads the rest.
 - `python3 3dslink.py ftp status --host 172.20.10.12`: check whether ftpd is reachable and accepts login.
 - `python3 -m unittest discover -s tests -v`: run the full local test suite.
 

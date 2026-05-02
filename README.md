@@ -7,7 +7,7 @@ It supports two main workflows:
 - **Load and launch `.3dsx` apps through 3dslink NetLoader.** Use this when the Homebrew Launcher is open and you want to run one `.3dsx` immediately.
 - **Transfer files or directories through a 3DS FTP server such as ftpd.** Use this when you want to copy one file, rename it during upload, or sync the contents of a local directory to the SD card.
 
-The tool can discover NetLoader with UDP broadcast, discover FTP services with best-effort mDNS, or connect directly when you pass `--host`.
+The tool can discover NetLoader with UDP broadcast, discover FTP services with best-effort mDNS, prompt for an address in interactive terminals, or connect directly when you pass `--host`.
 
 ## Requirements
 
@@ -25,8 +25,8 @@ The tool can discover NetLoader with UDP broadcast, discover FTP services with b
 | Legacy NetLoader load | `FILE` | Old flat form. Still works, but prints a deprecation warning. | `python3 3dslink.py sample-app.3dsx` |
 | Check NetLoader reachability | `netloader status [--host HOST] [--port PORT]` | Checks discovery, resolution, and TCP reachability. Restart NetLoader afterward before loading. | `python3 3dslink.py netloader status --host 172.20.10.12` |
 | Default status check | `status [--host HOST] [--port PORT]` | Same as `netloader status`. | `python3 3dslink.py status --host 172.20.10.12` |
-| Upload with FTP | `ftp upload [--host HOST] [--port PORT] [--user USER] [--password PASSWORD] --source PATH --dest PATH` | Uploads a file or the contents of a directory. `upload` is the default FTP action. | `python3 3dslink.py ftp upload --host 192.168.0.10 --source ./3ds --dest /3ds/` |
-| Upload with FTP shorthand | `ftp [--host HOST] [--port PORT] [--user USER] [--password PASSWORD] --source PATH --dest PATH` | Same as `ftp upload`. | `python3 3dslink.py ftp --host 192.168.0.10 --source app.3dsx --dest /3ds/` |
+| Upload with FTP | `ftp upload [--host HOST] [--port PORT] [--user USER] [--password PASSWORD] [--unarchive] [--patterns PATTERN] --source PATH [--source PATH ...] --dest PATH` | Uploads one or more files, directories, or archive sources. `upload` is the default FTP action. | `python3 3dslink.py ftp upload --host 192.168.0.10 --source ./3ds --dest /3ds/` |
+| Upload with FTP shorthand | `ftp [--host HOST] [--port PORT] [--user USER] [--password PASSWORD] [--unarchive] [--patterns PATTERN] --source PATH [--source PATH ...] --dest PATH` | Same as `ftp upload`. | `python3 3dslink.py ftp --host 192.168.0.10 --source app.3dsx --dest /3ds/` |
 | Check FTP reachability | `ftp status [--host HOST] [--port PORT] [--user USER] [--password PASSWORD]` | Connects to FTP and verifies login. | `python3 3dslink.py ftp status --host 192.168.0.10` |
 | Show help | `--help` | Shows top-level CLI help. Use subcommand help for action-specific options. | `python3 3dslink.py ftp upload --help` |
 
@@ -37,14 +37,14 @@ NetLoader is for loading `.3dsx` apps only. The tool accepts a NetLoader source 
 | Option | Default | Description |
 | --- | --- | --- |
 | `FILE` | required | Local `.3dsx` file to load and launch. |
-| `--host HOST` | auto-discovery | 3DS hostname or IP address. If omitted, the tool sends UDP NetLoader discovery packets. |
+| `--host HOST` | auto-discovery or prompt | 3DS hostname or IP address. If omitted, the tool sends UDP NetLoader discovery packets. If discovery fails in an interactive terminal, it prompts for `host` or `host:port`. |
 | `--port PORT` | `17491` | NetLoader discovery and transfer port. |
 
 Typical workflow:
 
 1. Open the Homebrew Launcher on the 3DS.
 2. Press `Y` to enter the 3dslink NetLoader screen.
-3. Run `python3 3dslink.py netloader load <file>`, or pass `--host <IP>` if broadcast discovery is blocked.
+3. Run `python3 3dslink.py netloader load <file>`, or pass `--host <IP>` if broadcast discovery is blocked. In an interactive terminal, failed discovery prompts for `host` or `host:port`.
 
 `netloader status` is intentionally limited to a TCP reachability check. NetLoader expects real `.3dsx` load traffic, so a status check can leave the 3DS unable to accept the next load. After running `netloader status`, restart NetLoader before loading a file: press `B` to go back, then press `Y` in the Homebrew Launcher.
 
@@ -54,12 +54,14 @@ FTP mode is for transferring files to a 3DS FTP server such as ftpd. It does not
 
 | Option | Default | Description |
 | --- | --- | --- |
-| `--source PATH` | required | Local file or directory to upload. |
+| `--source PATH` | required | Local file or directory to upload. Repeat `--source` to upload multiple paths in one command. |
 | `--dest PATH` | required | Remote destination file or directory path. |
 | `--host HOST` | mDNS discovery or prompt | 3DS FTP hostname or IP address. |
 | `--port PORT` | `5000` | FTP port. |
 | `--user USER` | `anonymous` | FTP username. |
 | `--password PASSWORD` | empty | FTP password. |
+| `--unarchive` | prompt when interactive | Extract `.zip` or `.7z` archives into one unique temporary directory, then upload the extracted files into `--dest`. If omitted and archives are found in an interactive terminal, the prompt defaults to yes. Answering no ignores archive files and uploads the remaining files that match `--patterns`. `.zip` uses Python's standard library; `.7z` requires a `7z` or `7zz` command in `PATH`. |
+| `--patterns PATTERN` | none | Upload only files matching a shell-style pattern, such as `*.nds` or `*.gba`. Repeat `--patterns` for multiple patterns. Filters apply after unarchiving. |
 
 Destination behavior:
 
@@ -68,6 +70,7 @@ Destination behavior:
 | file | remote directory, such as `/3ds/` | Uploads as `/3ds/<local basename>`. |
 | file | remote file, such as `/3ds/app.3dsx` | Uploads to that exact path, allowing rename. |
 | directory | remote directory, such as `/3ds/` | Uploads everything inside the local directory into the remote directory, preserving relative paths. |
+| multiple `--source` values | remote directory, such as `/3ds/` | Uploads each source into that destination directory. |
 
 FTP upload behavior:
 
@@ -78,23 +81,31 @@ FTP upload behavior:
 | Remote file exists with a different size | Uploads with `_1`, `_2`, etc. before the extension. |
 | Upload is active | Prints progress during transfer. |
 | Upload finishes | Prints a summary of uploaded, skipped, and renamed uploads. |
+| `--unarchive` is set on an archive file | Extracts that archive into one unique temporary directory, then uploads the extracted contents into the destination root. |
+| `--unarchive` is set on a directory | Recursively extracts every `.zip` and `.7z` in the directory into one unique temporary directory, then uploads the extracted contents into the destination root. |
+| Archives are found and `--unarchive` is omitted in an interactive terminal | Prompts whether to extract archives. The default `y` extracts them; `n` ignores archive files and uploads the rest. |
+| `--patterns` is set | Filters source files, or extracted files when combined with `--unarchive`. |
 
 Examples:
 
 ```bash
 python3 3dslink.py ftp upload --host 192.168.0.10 --source sample-app.3dsx --dest /3ds/
 python3 3dslink.py ftp upload --host 192.168.0.10 --source sample-app.3dsx --dest /3ds/renamed.3dsx
+python3 3dslink.py ftp upload --host 192.168.0.10 --source first.nds --source second.gba --dest /roms/
 python3 3dslink.py ftp upload --host 192.168.0.10 --source ./3ds --dest /3ds/
+python3 3dslink.py ftp upload --host 192.168.0.10 --source roms.zip --dest /roms/ --unarchive --patterns "*.nds" --patterns "*.gba"
+python3 3dslink.py ftp upload --host 192.168.0.10 --source ./archives --dest /roms/ --unarchive --patterns "*.nds"
 ```
 
 ## Troubleshooting
 
-- If NetLoader discovery fails, make sure the 3DS is on the NetLoader screen and both devices are on the same subnet.
+- If NetLoader discovery fails, make sure the 3DS is on the NetLoader screen and both devices are on the same subnet. In an interactive terminal, enter the displayed `host` or `host:port` when prompted.
 - If broadcast traffic is blocked, pass `--host <3DS_IP>` directly.
 - If NetLoader rejects the local file, confirm it is a `.3dsx` file or has a valid `.3dsx` header.
 - If you ran `netloader status`, restart NetLoader before loading a file by pressing `B`, then `Y` in the Homebrew Launcher.
 - If FTP discovery fails in a script or CI job, pass `ftp --host <3DS_IP>` directly.
 - If an FTP directory upload puts files somewhere unexpected, confirm that `--dest` is the target directory. Directory sources always copy their contents into the destination directory.
+- If `.7z` extraction fails, install a `7z` or `7zz` command and make sure it is available in `PATH`.
 
 ## Testing
 
@@ -114,8 +125,12 @@ CI runs the same test suite on push and pull request for Python 3.11, 3.12, and 
 - Added explicit `netloader load` and `ftp upload` actions while keeping those actions as each mode's default.
 - Added `status` checks for NetLoader, FTP, and the default NetLoader command path.
 - Added a NetLoader status warning because checking the TCP port can require restarting NetLoader before the next load.
+- Added an interactive NetLoader prompt for `host` or `host:port` when UDP discovery fails.
 - Added FTP upload support through Python's standard-library `ftplib`, defaulting to port `5000`, passive mode, and anonymous login.
 - Reworked FTP uploads to use `--source` and `--dest`, support file and directory sources, create missing destination directories, skip same-size files, rename different-size conflicts, show progress, and print a summary.
+- Added FTP `--unarchive` for `.zip` and `.7z` sources, including directory sources containing archives, and `--patterns` for shell-style upload filtering.
+- Added an interactive FTP archive prompt that defaults to extracting archives and can ignore archives while uploading the rest.
+- Added repeatable FTP `--source` for uploading multiple paths in one command.
 - Restricted NetLoader transfers to `.3dsx` files or files with a `.3dsx` header.
 - Kept the old flat NetLoader CLI form temporarily with a deprecation warning.
 - Reorganized the README around NetLoader and FTP workflows with CLI reference tables.

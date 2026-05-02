@@ -1,10 +1,15 @@
 import argparse
+import fnmatch
 import ftplib
 import os
 import posixpath
+import shutil
 import socket
 import struct
+import subprocess
 import sys
+import tempfile
+import zipfile
 import zlib
 
 NETLOADER_COMMAND = "netloader"
@@ -21,6 +26,10 @@ DISCOVERY_REQUEST = b"3dsboot"
 DISCOVERY_RESPONSE_PREFIX = b"boot3ds"
 ZLIB_CHUNK = 16 * 1024
 FTP_CHUNK = 16 * 1024
+FTP_ARCHIVE_UNARCHIVE = "unarchive"
+FTP_ARCHIVE_UPLOAD = "upload"
+FTP_ARCHIVE_SKIP = "skip"
+SEVEN_ZIP_COMMANDS = ("7zz", "7z")
 THREEDSX_MAGIC = b"3DSX"
 MDNS_ADDR = "224.0.0.251"
 MDNS_PORT = 5353
@@ -249,7 +258,7 @@ def discover_ftp_mdns(timeout=MDNS_DISCOVERY_TIMEOUT):
     return candidates
 
 
-def parse_host_port(value, default_port):
+def parse_host_port(value, default_port, label="host"):
     host, separator, port_text = value.rpartition(':')
     if not separator:
         return value, default_port
@@ -257,16 +266,16 @@ def parse_host_port(value, default_port):
     try:
         port = int(port_text)
     except ValueError as exc:
-        raise NetloaderError("FTP host prompt must be a host or host:port") from exc
+        raise NetloaderError(f"{label} prompt must be a host or host:port") from exc
     if not 1 <= port <= 65535:
-        raise NetloaderError("FTP port must be between 1 and 65535")
+        raise NetloaderError(f"{label} port must be between 1 and 65535")
 
     return host, port
 
 
 def resolve_ftp_host(host, port, stdin=sys.stdin):
     if host is not None:
-        resolved_host, resolved_port = parse_host_port(host, port)
+        resolved_host, resolved_port = parse_host_port(host, port, "FTP host")
         return resolve_host(resolved_host, resolved_port), resolved_port
 
     candidates = discover_ftp_mdns()
@@ -279,7 +288,7 @@ def resolve_ftp_host(host, port, stdin=sys.stdin):
         value = input(prompt).strip()
         if not value:
             raise DiscoveryError("FTP host is required")
-        prompted_host, prompted_port = parse_host_port(value, port)
+        prompted_host, prompted_port = parse_host_port(value, port, "FTP host")
         return resolve_host(prompted_host, prompted_port), prompted_port
 
     raise DiscoveryError("could not resolve a 3DS FTP host. Pass --host, or run interactively to enter host or host:port")
@@ -294,11 +303,157 @@ def validate_input_file(path):
         raise NetloaderError(f"file is empty: {path}")
 
 
+def normalize_ftp_sources(sources):
+    if isinstance(sources, (list, tuple)):
+        return list(sources)
+    return [sources]
+
+
 def validate_ftp_source(path):
     if not os.path.exists(path):
         raise FTPTransferError(f"source not found: {path}")
     if not os.path.isfile(path) and not os.path.isdir(path):
         raise FTPTransferError(f"source is not a file or directory: {path}")
+
+
+def normalize_patterns(patterns):
+    return [pattern for pattern in (patterns or []) if pattern]
+
+
+def path_matches_filters(relative_path, patterns):
+    if not patterns:
+        return True
+
+    basename = posixpath.basename(relative_path)
+    return any(
+        fnmatch.fnmatch(relative_path, pattern) or fnmatch.fnmatch(basename, pattern)
+        for pattern in patterns
+    )
+
+
+def safe_extract_zip(archive_path, destination):
+    destination_abs = os.path.abspath(destination)
+    with zipfile.ZipFile(archive_path) as archive:
+        for member in archive.infolist():
+            target = os.path.abspath(os.path.join(destination, member.filename))
+            if target != destination_abs and not target.startswith(destination_abs + os.sep):
+                raise FTPTransferError(f"archive member escapes destination: {member.filename}")
+        archive.extractall(destination)
+
+
+def find_7z_command():
+    for command in SEVEN_ZIP_COMMANDS:
+        resolved = shutil.which(command)
+        if resolved:
+            return resolved
+    return None
+
+
+def unarchive_ftp_source(source, destination):
+    validate_input_file(source)
+    lower_source = source.lower()
+
+    if lower_source.endswith(".zip"):
+        safe_extract_zip(source, destination)
+        return destination
+
+    if lower_source.endswith(".7z"):
+        command = find_7z_command()
+        if command is None:
+            raise FTPTransferError("extracting .7z files requires a 7z or 7zz command in PATH")
+
+        try:
+            subprocess.run(
+                [command, "x", source, f"-o{destination}", "-y"],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        except subprocess.CalledProcessError as exc:
+            message = exc.stderr.strip() or exc.stdout.strip() or str(exc)
+            raise FTPTransferError(f"failed to extract {source}: {message}") from exc
+        return destination
+
+    raise FTPTransferError("--unarchive only supports .zip and .7z sources")
+
+
+def is_supported_archive(path):
+    lower_path = path.lower()
+    return lower_path.endswith(".zip") or lower_path.endswith(".7z")
+
+
+def iter_archive_sources(sources):
+    for source in normalize_ftp_sources(sources):
+        if os.path.isfile(source):
+            if is_supported_archive(source):
+                yield source, os.path.basename(source)
+                continue
+            raise FTPTransferError("--unarchive only supports .zip and .7z file sources")
+
+        if not os.path.isdir(source):
+            raise FTPTransferError(f"source is not a file or directory: {source}")
+
+        for root, dirs, files in os.walk(source):
+            dirs.sort()
+            files.sort()
+            for filename in files:
+                local_path = os.path.join(root, filename)
+                if is_supported_archive(local_path):
+                    relative_path = os.path.relpath(local_path, source).replace(os.sep, "/")
+                    yield local_path, relative_path
+
+
+def unarchive_ftp_sources(sources, destination):
+    for source in normalize_ftp_sources(sources):
+        validate_ftp_source(source)
+
+    archive_count = 0
+
+    for archive_count, (archive_path, _) in enumerate(iter_archive_sources(sources), start=1):
+        unarchive_ftp_source(archive_path, destination)
+
+    if archive_count == 0:
+        raise FTPTransferError("no .zip or .7z archives found to unarchive")
+
+    return destination
+
+
+def has_archive_sources(sources):
+    for source in normalize_ftp_sources(sources):
+        if os.path.isfile(source):
+            if is_supported_archive(source):
+                return True
+            continue
+
+        if not os.path.isdir(source):
+            continue
+
+        for _, _, files in os.walk(source):
+            if any(is_supported_archive(filename) for filename in files):
+                return True
+
+    return False
+
+
+def should_unarchive_ftp(args, stdin=None):
+    return get_ftp_archive_action(args, stdin=stdin) == FTP_ARCHIVE_UNARCHIVE
+
+
+def get_ftp_archive_action(args, stdin=None):
+    if args.unarchive:
+        return FTP_ARCHIVE_UNARCHIVE
+    if stdin is None:
+        stdin = sys.stdin
+    if not stdin.isatty():
+        return FTP_ARCHIVE_UPLOAD
+    if not has_archive_sources(args.source):
+        return FTP_ARCHIVE_UPLOAD
+
+    answer = input("Archive files found. Extract archives before upload? [Y/n]: ").strip().lower()
+    if answer in ("", "y", "yes"):
+        return FTP_ARCHIVE_UNARCHIVE
+    return FTP_ARCHIVE_SKIP
 
 
 def file_has_3dsx_magic(path):
@@ -434,9 +589,15 @@ def ensure_remote_dir(ftp, path):
             pass
 
 
-def iter_ftp_sources(source):
+def iter_ftp_sources(source, patterns=None, skip_archives=False):
+    patterns = normalize_patterns(patterns)
+
     if os.path.isfile(source):
-        yield source, os.path.basename(source)
+        relative_path = os.path.basename(source)
+        if skip_archives and is_supported_archive(source):
+            return
+        if path_matches_filters(relative_path, patterns):
+            yield source, relative_path
         return
 
     for root, dirs, files in os.walk(source):
@@ -445,7 +606,10 @@ def iter_ftp_sources(source):
         for filename in files:
             local_path = os.path.join(root, filename)
             relative_path = os.path.relpath(local_path, source).replace(os.sep, "/")
-            yield local_path, relative_path
+            if skip_archives and is_supported_archive(local_path):
+                continue
+            if path_matches_filters(relative_path, patterns):
+                yield local_path, relative_path
 
 
 def make_unique_remote_path(ftp, destination):
@@ -517,8 +681,10 @@ def print_ftp_summary(uploaded, skipped, renamed):
         print(f"  {local_path} -> {renamed_path} (existing {original_path} has different size)")
 
 
-def send_ftp(host, port, source, dest, user, password):
-    validate_ftp_source(source)
+def send_ftp(host, port, source, dest, user, password, patterns=None, skip_archives=False):
+    sources = normalize_ftp_sources(source)
+    for source_path in sources:
+        validate_ftp_source(source_path)
 
     try:
         with ftplib.FTP() as ftp:
@@ -527,34 +693,42 @@ def send_ftp(host, port, source, dest, user, password):
             ftp.login(user=user, passwd=password)
 
             print(f"Connected to FTP at {host}:{port}")
-            base_destination, source_is_dir = resolve_ftp_destination(ftp, source, dest)
+            multiple_sources = len(sources) > 1
+            if multiple_sources:
+                base_destination = normalize_remote_path(dest)
+                ensure_remote_dir(ftp, base_destination)
+            else:
+                base_destination, source_is_dir = resolve_ftp_destination(ftp, sources[0], dest)
+
             uploaded = []
             skipped = []
             renamed = []
 
-            for local_path, relative_path in iter_ftp_sources(source):
-                local_size = os.path.getsize(local_path)
-                if source_is_dir:
-                    destination = join_remote_path(base_destination, relative_path)
-                    ensure_remote_dir(ftp, remote_parent(destination))
-                else:
-                    destination = base_destination
+            for source_path in sources:
+                source_is_dir = os.path.isdir(source_path)
+                for local_path, relative_path in iter_ftp_sources(source_path, patterns, skip_archives=skip_archives):
+                    local_size = os.path.getsize(local_path)
+                    if multiple_sources or source_is_dir:
+                        destination = join_remote_path(base_destination, relative_path)
+                        ensure_remote_dir(ftp, remote_parent(destination))
+                    else:
+                        destination = base_destination
 
-                existing_size = remote_size(ftp, destination)
-                if existing_size == local_size:
-                    print(f"Skipping {local_path}; {destination} already exists with the same size")
-                    skipped.append((local_path, destination))
-                    continue
-                if existing_size is not None and existing_size != local_size:
-                    original_destination = destination
-                    destination = make_unique_remote_path(ftp, destination)
-                    print(f"Remote file size differs; uploading {local_path} as {destination}")
+                    existing_size = remote_size(ftp, destination)
+                    if existing_size == local_size:
+                        print(f"Skipping {local_path}; {destination} already exists with the same size")
+                        skipped.append((local_path, destination))
+                        continue
+                    if existing_size is not None and existing_size != local_size:
+                        original_destination = destination
+                        destination = make_unique_remote_path(ftp, destination)
+                        print(f"Remote file size differs; uploading {local_path} as {destination}")
+                        upload_ftp_file(ftp, local_path, destination)
+                        renamed.append((local_path, original_destination, destination))
+                        continue
+
                     upload_ftp_file(ftp, local_path, destination)
-                    renamed.append((local_path, original_destination, destination))
-                    continue
-
-                upload_ftp_file(ftp, local_path, destination)
-                uploaded.append((local_path, destination))
+                    uploaded.append((local_path, destination))
 
             print_ftp_summary(uploaded, skipped, renamed)
     except ftplib.all_errors + (OSError,) as exc:
@@ -605,8 +779,18 @@ def add_netloader_arguments(parser):
 
 
 def add_ftp_arguments(parser):
-    parser.add_argument("--source", required=True, help="Local file or directory to upload")
+    parser.add_argument("--source", action="append", required=True, help="Local file or directory to upload. Repeat for multiple sources")
     parser.add_argument("--dest", required=True, help="Remote destination file or directory path")
+    parser.add_argument(
+        "--unarchive",
+        action="store_true",
+        help="Extract .zip or .7z archives before uploading. If omitted in an interactive terminal, archives trigger a yes/no prompt.",
+    )
+    parser.add_argument(
+        "--patterns",
+        action="append",
+        help="Upload only files matching a shell-style pattern, such as '*.nds' or '*.gba'. Repeat for multiple patterns.",
+    )
     parser.add_argument(
         "--host",
         help="3DS FTP hostname or IPv4 address. If omitted, the utility tries mDNS discovery or prompts interactively.",
@@ -759,23 +943,37 @@ def parse_args(argv):
     return args
 
 
-def resolve_netloader_host(args):
+def resolve_netloader_host(args, stdin=None):
+    if stdin is None:
+        stdin = sys.stdin
+
     host = args.host
     if host is None:
         print(f"Discovering a 3DS on the local network via UDP broadcast on port {args.port}...")
-        host = discover_3ds(args.port, DEFAULT_DISCOVERY_RETRIES, 1.0)
-        print(f"Discovered 3DS at {host}")
-    else:
-        host = resolve_host(host, args.port)
-    return host
+        try:
+            host = discover_3ds(args.port, DEFAULT_DISCOVERY_RETRIES, 1.0)
+            print(f"Discovered 3DS at {host}")
+            return host, args.port
+        except DiscoveryError:
+            if not stdin.isatty():
+                raise
+
+            value = input("Enter 3DS NetLoader host or host:port: ").strip()
+            if not value:
+                raise DiscoveryError("NetLoader host is required")
+            prompted_host, prompted_port = parse_host_port(value, args.port, "NetLoader host")
+            return resolve_host(prompted_host, prompted_port), prompted_port
+
+    resolved_host, resolved_port = parse_host_port(host, args.port, "NetLoader host")
+    return resolve_host(resolved_host, resolved_port), resolved_port
 
 
 def run_netloader(args):
-    host = resolve_netloader_host(args)
+    host, port = resolve_netloader_host(args)
 
     send_3dsx(
         host=host,
-        port=args.port,
+        port=port,
         path=args.file,
     )
     print("Transfer complete. Check your 3DS screen.")
@@ -783,6 +981,21 @@ def run_netloader(args):
 
 def run_ftp(args):
     host, port = resolve_ftp_host(args.host, args.port)
+    archive_action = get_ftp_archive_action(args)
+    if archive_action == FTP_ARCHIVE_UNARCHIVE:
+        with tempfile.TemporaryDirectory(prefix="3dslink-ftp-") as temp_dir:
+            source = unarchive_ftp_sources(args.source, temp_dir)
+            send_ftp(
+                host=host,
+                port=port,
+                source=source,
+                dest=args.dest,
+                user=args.user,
+                password=args.password,
+                patterns=args.patterns,
+            )
+        return
+
     send_ftp(
         host=host,
         port=port,
@@ -790,6 +1003,8 @@ def run_ftp(args):
         dest=args.dest,
         user=args.user,
         password=args.password,
+        patterns=args.patterns,
+        skip_archives=archive_action == FTP_ARCHIVE_SKIP,
     )
 
 
@@ -799,8 +1014,8 @@ def run_status(args):
         check_ftp_status(host, port, args.user, args.password)
         return
 
-    host = resolve_netloader_host(args)
-    check_tcp_status(host, args.port, "NetLoader")
+    host, port = resolve_netloader_host(args)
+    check_tcp_status(host, port, "NetLoader")
 
 
 def main(argv=None):
