@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import zipfile
+import time
 
 from core import (
     DEFAULT_FTP_PORT, DEFAULT_TIMEOUT, FTP_ARCHIVE_SKIP, FTP_ARCHIVE_UNARCHIVE, FTP_ARCHIVE_UPLOAD,
@@ -361,6 +362,19 @@ def make_unique_remote_path(ftp, destination):
     raise FTPTransferError(f"could not find an unused remote filename for {destination}")
 
 
+def make_unique_local_path(destination):
+    directory = os.path.dirname(destination)
+    basename = os.path.basename(destination)
+    stem, extension = os.path.splitext(basename)
+    index = 1
+    while index <= 999:
+        candidate = os.path.join(directory, f"{stem}_{index}{extension}")
+        if not os.path.exists(candidate):
+            return candidate
+        index += 1
+    raise FTPTransferError(f"could not find an unused local filename for {destination}")
+
+
 def resolve_ftp_destination(ftp, source, dest):
     destination = normalize_remote_path(dest)
     source_is_dir = os.path.isdir(source)
@@ -385,19 +399,23 @@ def print_upload_progress(label, sent, total):
         print(f"Uploading {label}: {sent} bytes")
 
 
-def upload_ftp_file(ftp, local_path, remote_path):
+def upload_ftp_file(ftp, local_path, remote_path, progress=None, item_index=1, item_total=1):
     total = os.path.getsize(local_path)
     sent = 0
     last_reported_percent = -1
 
-    print(f"Uploading {local_path} -> {remote_path}")
+    if progress is None:
+        print(f"Uploading {local_path} -> {remote_path}")
 
     def report(block):
         nonlocal sent, last_reported_percent
         sent += len(block)
         percent = 100 if not total else int(sent * 100 / total)
         if percent == 100 or percent >= last_reported_percent + 10:
-            print_upload_progress(posixpath.basename(remote_path), sent, total)
+            if progress is None:
+                print_upload_progress(posixpath.basename(remote_path), sent, total)
+            else:
+                progress(posixpath.basename(remote_path), sent, total, item_index, item_total)
             last_reported_percent = percent
 
     with open(local_path, 'rb') as file_obj:
@@ -533,6 +551,58 @@ def ftp_entry_sort_key(entry):
     return (entry["type"] != "dir", entry["name"].lower())
 
 
+def normalize_local_explorer_path(path):
+    return os.path.abspath(os.path.expanduser(path or "~"))
+
+
+def validate_local_explorer_dir(path):
+    normalized = normalize_local_explorer_path(path)
+    if not os.path.isdir(normalized):
+        raise FTPTransferError(f"explorer source is not a directory: {path}")
+    return normalized
+
+
+def is_within_local_root(path, root):
+    path = os.path.abspath(path)
+    root = os.path.abspath(root)
+    return path == root or path.startswith(root + os.sep)
+
+
+def local_entry_sort_key(entry):
+    return (entry["type"] != "dir", entry["name"].lower())
+
+
+def list_local_directory(path, root=None):
+    entries = []
+    if root is None or os.path.abspath(path) != os.path.abspath(root):
+        entries.append({"name": "..", "type": "dir", "size": None, "modify": None})
+    with os.scandir(path) as iterator:
+        for item in iterator:
+            try:
+                stat = item.stat()
+            except OSError:
+                stat = None
+            entries.append(
+                {
+                    "name": item.name,
+                    "type": "dir" if item.is_dir(follow_symlinks=False) else "file",
+                    "size": None if stat is None or item.is_dir(follow_symlinks=False) else stat.st_size,
+                    "modify": None if stat is None else time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(stat.st_mtime)),
+                }
+            )
+    return entries[:1] + sorted(entries[1:], key=local_entry_sort_key) if entries and entries[0]["name"] == ".." else sorted(entries, key=local_entry_sort_key)
+
+
+def join_local_explorer_path(current, name, root=None):
+    if name == "..":
+        candidate = os.path.dirname(current.rstrip(os.sep)) or os.sep
+    else:
+        candidate = os.path.abspath(os.path.join(current, name))
+    if root is not None and not is_within_local_root(candidate, root):
+        return os.path.abspath(root)
+    return candidate
+
+
 def list_ftp_directory(ftp, path):
     entries = [{"name": "..", "type": "dir", "size": None, "modify": None}]
     original = ftp.pwd()
@@ -579,6 +649,16 @@ def ftp_entry_display_name(entry):
     return entry["name"]
 
 
+def explorer_join_path(side, current_path, name):
+    if side == "local":
+        return join_local_explorer_path(current_path, name)
+    return join_ftp_explorer_path(current_path, name)
+
+
+def explorer_basename(side, path):
+    return os.path.basename(path.rstrip(os.sep)) if side == "local" else posixpath.basename(path.rstrip("/"))
+
+
 def selectable_ftp_entries(current_path, entries, selected, selected_paths):
     selected_items = []
     by_path = {}
@@ -612,6 +692,21 @@ def move_ftp_selection(current_path, entries, selected, selected_paths, directio
     selected_paths = add_entry_to_selection(current_path, entries, selected, selected_paths)
     selected = max(0, min(len(entries) - 1, selected + direction))
     selected_paths = add_entry_to_selection(current_path, entries, selected, selected_paths)
+    return selected, selected_paths
+
+
+def add_explorer_entry_to_selection(side, current_path, entries, selected, selected_paths):
+    entry = entries[selected]
+    if entry["name"] == "..":
+        return selected_paths
+    selected_paths.add((side, explorer_join_path(side, current_path, entry["name"])))
+    return selected_paths
+
+
+def move_explorer_selection(side, current_path, entries, selected, selected_paths, direction):
+    selected_paths = add_explorer_entry_to_selection(side, current_path, entries, selected, selected_paths)
+    selected = max(0, min(len(entries) - 1, selected + direction))
+    selected_paths = add_explorer_entry_to_selection(side, current_path, entries, selected, selected_paths)
     return selected, selected_paths
 
 
@@ -651,6 +746,183 @@ def move_ftp_paths(ftp, items, destination_dir):
     return moved
 
 
+def count_local_transfer_files(items, skip_archives=False):
+    count = 0
+    for source_path, _ in items:
+        if os.path.isfile(source_path):
+            if skip_archives and is_supported_archive(source_path):
+                continue
+            count += 1
+            continue
+        for root, _, files in os.walk(source_path):
+            for filename in files:
+                path = os.path.join(root, filename)
+                if skip_archives and is_supported_archive(path):
+                    continue
+                count += 1
+    return count
+
+
+def count_remote_transfer_files(ftp, items):
+    count = 0
+    for source_path, entry in items:
+        if entry["type"] != "dir":
+            count += 1
+            continue
+        for child in list_ftp_directory(ftp, source_path):
+            if child["name"] == "..":
+                continue
+            child_path = join_ftp_explorer_path(source_path, child["name"])
+            count += count_remote_transfer_files(ftp, [(child_path, child)])
+    return count
+
+
+def upload_local_path_to_remote(ftp, local_path, destination_dir, skip_archives=False, progress=None, item_state=None):
+    if skip_archives and is_supported_archive(local_path):
+        return None
+    destination = join_remote_path(destination_dir, os.path.basename(local_path.rstrip(os.sep)))
+    if os.path.isdir(local_path):
+        ensure_remote_dir(ftp, destination)
+        for name in sorted(os.listdir(local_path)):
+            upload_local_path_to_remote(
+                ftp,
+                os.path.join(local_path, name),
+                destination,
+                skip_archives=skip_archives,
+                progress=progress,
+                item_state=item_state,
+            )
+        return destination
+
+    local_size = os.path.getsize(local_path)
+    existing_size = remote_size(ftp, destination)
+    if existing_size == local_size:
+        return None
+    if existing_size is not None and existing_size != local_size:
+        destination = make_unique_remote_path(ftp, destination)
+
+    ensure_remote_dir(ftp, remote_parent(destination))
+    item_index = 1
+    item_total = 1
+    if item_state is not None:
+        item_state["current"] += 1
+        item_index = item_state["current"]
+        item_total = item_state["total"]
+    upload_ftp_file(ftp, local_path, destination, progress=progress, item_index=item_index, item_total=item_total)
+    return destination
+
+
+def download_remote_path_to_local(ftp, remote_path, entry_type, destination_dir, progress=None, item_state=None):
+    destination = os.path.join(destination_dir, posixpath.basename(remote_path.rstrip("/")))
+    if entry_type == "dir":
+        os.makedirs(destination, exist_ok=True)
+        for entry in list_ftp_directory(ftp, remote_path):
+            if entry["name"] == "..":
+                continue
+            child_path = join_ftp_explorer_path(remote_path, entry["name"])
+            download_remote_path_to_local(ftp, child_path, entry["type"], destination, progress=progress, item_state=item_state)
+        return destination
+
+    os.makedirs(destination_dir, exist_ok=True)
+    remote_file_size = remote_size(ftp, remote_path)
+    if os.path.exists(destination):
+        if remote_file_size is not None and os.path.getsize(destination) == remote_file_size:
+            return None
+        destination = make_unique_local_path(destination)
+
+    item_index = 1
+    item_total = 1
+    if item_state is not None:
+        item_state["current"] += 1
+        item_index = item_state["current"]
+        item_total = item_state["total"]
+
+    received = 0
+
+    def report(block):
+        nonlocal received
+        received += len(block)
+        file_obj.write(block)
+        if progress is not None:
+            progress(posixpath.basename(remote_path), received, remote_file_size or 0, item_index, item_total)
+
+    with open(destination, "wb") as file_obj:
+        ftp.retrbinary(f"RETR {remote_path}", report, blocksize=FTP_CHUNK)
+    return destination
+
+
+def delete_local_path(path, entry_type):
+    if entry_type == "dir":
+        shutil.rmtree(path)
+        return
+    os.remove(path)
+
+
+def copy_local_paths_to_remote(ftp, items, destination_dir, skip_archives=False, progress=None):
+    copied = []
+    item_state = {"current": 0, "total": count_local_transfer_files(items, skip_archives=skip_archives)}
+    for source_path, entry in items:
+        destination = upload_local_path_to_remote(
+            ftp,
+            source_path,
+            destination_dir,
+            skip_archives=skip_archives,
+            progress=progress,
+            item_state=item_state,
+        )
+        if destination is not None:
+            copied.append((source_path, destination))
+    return copied
+
+
+def copy_remote_paths_to_local(ftp, items, destination_dir, progress=None):
+    copied = []
+    item_state = {"current": 0, "total": count_remote_transfer_files(ftp, items)}
+    for source_path, entry in items:
+        destination = download_remote_path_to_local(
+            ftp,
+            source_path,
+            entry["type"],
+            destination_dir,
+            progress=progress,
+            item_state=item_state,
+        )
+        if destination is not None:
+            copied.append((source_path, destination))
+    return copied
+
+
+def move_local_paths(items, destination_dir):
+    moved = []
+    for source_path, entry in items:
+        destination = os.path.join(destination_dir, os.path.basename(source_path.rstrip(os.sep)))
+        if os.path.abspath(destination) == os.path.abspath(source_path):
+            continue
+        if entry["type"] == "dir" and os.path.abspath(destination).startswith(os.path.abspath(source_path) + os.sep):
+            raise FTPTransferError(f"cannot move a directory into itself: {source_path}")
+        shutil.move(source_path, destination)
+        moved.append((source_path, destination))
+    return moved
+
+
+def copy_or_move_explorer_items(ftp, move_buffer, destination_side, destination_dir, skip_archives=False, progress=None):
+    if not move_buffer:
+        return []
+    source_side = move_buffer[0][0]
+    items = [(path, entry) for _, path, entry in move_buffer]
+    if source_side == "remote" and destination_side == "remote":
+        return move_ftp_paths(ftp, items, destination_dir)
+    if source_side == "local" and destination_side == "local":
+        return move_local_paths(items, destination_dir)
+    if source_side == "local" and destination_side == "remote":
+        return copy_local_paths_to_remote(ftp, items, destination_dir, skip_archives=skip_archives, progress=progress)
+    return copy_remote_paths_to_local(ftp, items, destination_dir, progress=progress)
+
+
+def explorer_items_have_archives(items):
+    return any(side == "local" and has_archive_sources(path) for side, path, _ in items)
+
+
 def truncate_text(text, width):
     if width <= 0:
         return ""
@@ -661,13 +933,31 @@ def truncate_text(text, width):
     return text[: width - 3] + "..." if width > 3 else text[:width]
 
 
+def draw_explorer_pane(stdscr, y, x, width, height, title, side, current_path, entries, selected, active, selected_paths):
+    attr = curses.A_BOLD | (curses.A_REVERSE if active else curses.A_NORMAL)
+    stdscr.addnstr(y, x, truncate_text(title, width - 1), width - 1, attr)
+    stdscr.addnstr(y + 1, x, truncate_text(current_path, width - 1), width - 1, curses.A_DIM)
+    visible_rows = max(1, height - 2)
+    offset = max(0, selected - visible_rows + 1)
+    for row, entry in enumerate(entries[offset: offset + visible_rows], start=y + 2):
+        path = explorer_join_path(side, current_path, entry["name"])
+        selected_marker = "*" if (side, path) in selected_paths else " "
+        prefix = "[Dir]" if entry["type"] == "dir" else "     "
+        label = f"{selected_marker} {prefix} {ftp_entry_display_name(entry)}"
+        row_attr = curses.A_REVERSE if active and offset + row - y - 2 == selected else curses.A_NORMAL
+        stdscr.addnstr(row, x, truncate_text(label, width - 1), width - 1, row_attr)
+
+
 def draw_ftp_explorer(
     stdscr,
-    current_path,
-    entries,
-    selected,
+    local_path,
+    local_entries,
+    local_selected,
+    remote_path,
+    remote_entries,
+    remote_selected,
+    active_side,
     message="",
-    metadata_loading=False,
     selected_paths=None,
     move_buffer=None,
 ):
@@ -680,45 +970,19 @@ def draw_ftp_explorer(
         return
 
     stdscr.erase()
-    stdscr.addnstr(0, 0, f"FTP Explorer: {current_path}", width - 1, curses.A_BOLD)
-    stdscr.addnstr(1, 0, "Up/Down/j/k move  Shift+Up/Down/J/K multi-select  Enter open/go up  Backspace up  m move  p/P paste  d delete  c/Esc cancel  q quit", width - 1)
+    stdscr.addnstr(0, 0, "FTP Explorer: Local <-> 3DS", width - 1, curses.A_BOLD)
+    stdscr.addnstr(1, 0, "Tab/Left/Right/h/l switch  Up/Down/j/k move  Space select  Enter open  Backspace up  m stage  p paste  P paste into dir  d delete  c cancel  q quit", width - 1)
 
-    split = max(24, width // 2)
-    list_width = min(split, width - 1)
-    detail_x = min(list_width + 2, width - 1)
-    detail_width = max(0, width - detail_x - 1)
-    visible_rows = max(1, height - 5)
-    offset = max(0, selected - visible_rows + 1)
+    pane_gap = 2
+    pane_width = max(10, (width - pane_gap) // 2)
+    pane_height = max(1, height - 5)
+    draw_explorer_pane(stdscr, 3, 0, pane_width, pane_height, "Local", "local", local_path, local_entries, local_selected, active_side == "local", selected_paths)
+    draw_explorer_pane(stdscr, 3, pane_width + pane_gap, max(10, width - pane_width - pane_gap - 1), pane_height, "3DS", "remote", remote_path, remote_entries, remote_selected, active_side == "remote", selected_paths)
 
-    for row, entry in enumerate(entries[offset: offset + visible_rows], start=3):
-        path = join_ftp_explorer_path(current_path, entry["name"])
-        selected_marker = "*" if path in selected_paths else " "
-        prefix = "[Dir]" if entry["type"] == "dir" else "     "
-        label = f"{selected_marker} {prefix} {ftp_entry_display_name(entry)}"
-        attr = curses.A_REVERSE if offset + row - 3 == selected else curses.A_NORMAL
-        stdscr.addnstr(row, 0, truncate_text(label, list_width - 1), list_width - 1, attr)
-
-    if entries and detail_width > 0:
-        entry = entries[selected]
-        selected_path = join_ftp_explorer_path(current_path, entry["name"])
-        size = "n/a" if entry["type"] == "dir" else format_size(entry["size"]) or "n/a"
-        details = [
-            ("Name", ftp_entry_display_name(entry)),
-            ("Type", "Directory" if entry["type"] == "dir" else "File"),
-            ("Path", selected_path),
-            ("Size", size),
-            ("Modified", parse_ftp_modify_time(entry["modify"]) or "n/a"),
-        ]
-        stdscr.addnstr(3, detail_x, "Metadata", detail_width, curses.A_BOLD)
-        if metadata_loading:
-            stdscr.addnstr(5, detail_x, "Loading...", detail_width)
-        else:
-            for index, (label, value) in enumerate(details, start=5):
-                if index >= height - 1:
-                    break
-                stdscr.addnstr(index, detail_x, truncate_text(f"{label}: {value}", detail_width), detail_width)
-
-    move_text = f"Move: {len(move_buffer)} item(s) ready. p pastes here, P pastes into selected dir, c/Esc cancels." if move_buffer else "Move: none. Press m to stage selected item(s) for moving."
+    source_text = ""
+    if move_buffer:
+        source_text = f" from {move_buffer[0][0]}"
+    move_text = f"Move: {len(move_buffer)} item(s){source_text} ready. p pastes here, P pastes into selected dir, c/Esc cancels." if move_buffer else "Move: none. Press m to stage selected item(s)."
     if height > 1:
         stdscr.addnstr(height - 2, 0, truncate_text(move_text, width - 1), width - 1, curses.A_DIM)
     if message and height > 0:
@@ -755,66 +1019,191 @@ def prompt_ftp_confirmation(stdscr, prompt):
             return False
 
 
-def ftp_explorer_loop(stdscr, ftp, start_path="/"):
+def prompt_archive_transfer_action(stdscr):
+    height, width = stdscr.getmaxyx()
+    if height <= 0 or width <= 0:
+        return FTP_ARCHIVE_SKIP
+
+    lines = [
+        "Archive files selected.",
+        "u: unarchive all before upload",
+        "s: skip archives",
+        "c/Esc: cancel",
+    ]
+    box_width = min(max(38, max(len(line) for line in lines) + 4), max(1, width - 2))
+    box_height = len(lines) + 2
+    top = max(0, (height - box_height) // 2)
+    left = max(0, (width - box_width) // 2)
+
+    for row in range(box_height):
+        stdscr.addnstr(top + row, left, " " * box_width, box_width, curses.A_REVERSE)
+
+    stdscr.addnstr(top, left, "+" + "-" * (box_width - 2) + "+", box_width, curses.A_REVERSE)
+    for index, line in enumerate(lines, start=1):
+        text = truncate_text(line, box_width - 4)
+        stdscr.addnstr(top + index, left, f"| {text.ljust(box_width - 4)} |", box_width, curses.A_REVERSE)
+    stdscr.addnstr(top + box_height - 1, left, "+" + "-" * (box_width - 2) + "+", box_width, curses.A_REVERSE)
+    stdscr.refresh()
+
+    while True:
+        key = stdscr.getch()
+        if key in (ord("u"), ord("U")):
+            return FTP_ARCHIVE_UNARCHIVE
+        if key in (ord("s"), ord("S")):
+            return FTP_ARCHIVE_SKIP
+        if key in (ord("c"), ord("C"), 27):
+            return None
+
+
+def draw_transfer_progress(stdscr, label, sent, total, item_index, item_total):
+    height, width = stdscr.getmaxyx()
+    if height <= 0 or width <= 0:
+        return
+
+    percent = 100 if not total else min(100, int(sent * 100 / total))
+    title = f"Transfer {item_index}/{max(1, item_total)}"
+    size_text = f"{format_size(sent)} / {format_size(total)}" if total else format_size(sent)
+    lines = [
+        title,
+        truncate_text(label, 60),
+        size_text,
+    ]
+    box_width = min(max(44, max(len(line) for line in lines) + 4), max(1, width - 2))
+    box_height = 7
+    top = max(0, (height - box_height) // 2)
+    left = max(0, (width - box_width) // 2)
+    inner_width = max(1, box_width - 4)
+    bar_width = max(1, inner_width - 7)
+    filled = min(bar_width, int(bar_width * percent / 100))
+    bar = "[" + "#" * filled + "-" * (bar_width - filled) + f"] {percent:3d}%"
+
+    for row in range(box_height):
+        stdscr.addnstr(top + row, left, " " * box_width, box_width, curses.A_REVERSE)
+
+    stdscr.addnstr(top, left, "+" + "-" * (box_width - 2) + "+", box_width, curses.A_REVERSE)
+    stdscr.addnstr(top + 1, left, f"| {title.ljust(inner_width)} |", box_width, curses.A_REVERSE)
+    stdscr.addnstr(top + 2, left, f"| {truncate_text(label, inner_width).ljust(inner_width)} |", box_width, curses.A_REVERSE)
+    stdscr.addnstr(top + 3, left, f"| {bar[:inner_width].ljust(inner_width)} |", box_width, curses.A_REVERSE)
+    stdscr.addnstr(top + 4, left, f"| {size_text.ljust(inner_width)} |", box_width, curses.A_REVERSE)
+    stdscr.addnstr(top + 5, left, f"| {'Please wait...'.ljust(inner_width)} |", box_width, curses.A_REVERSE)
+    stdscr.addnstr(top + box_height - 1, left, "+" + "-" * (box_width - 2) + "+", box_width, curses.A_REVERSE)
+    stdscr.refresh()
+
+
+def active_explorer_state(active_side, local_path, local_entries, local_selected, remote_path, remote_entries, remote_selected):
+    if active_side == "local":
+        return local_path, local_entries, local_selected
+    return remote_path, remote_entries, remote_selected
+
+
+def selected_explorer_items(side, current_path, entries, selected, selected_paths):
+    selected_items = []
+    for entry in entries:
+        if entry["name"] == "..":
+            continue
+        path = explorer_join_path(side, current_path, entry["name"])
+        if (side, path) in selected_paths:
+            selected_items.append((side, path, entry))
+    if selected_items:
+        return selected_items
+    entry = entries[selected]
+    if entry["name"] == "..":
+        return []
+    return [(side, explorer_join_path(side, current_path, entry["name"]), entry)]
+
+
+def prepare_explorer_transfer_items(stdscr, move_buffer, destination_side):
+    if not move_buffer or move_buffer[0][0] != "local" or destination_side != "remote":
+        return move_buffer, False, None
+    if not explorer_items_have_archives(move_buffer):
+        return move_buffer, False, None
+
+    action = prompt_archive_transfer_action(stdscr)
+    if action is None:
+        return None, False, None
+    if action == FTP_ARCHIVE_SKIP:
+        return move_buffer, True, None
+
+    temp_dir = tempfile.mkdtemp(prefix="3dsutil-explorer-")
+    archive_paths = [path for _, path, _ in move_buffer if has_archive_sources(path)]
+    unarchive_ftp_sources(archive_paths, temp_dir)
+    prepared = [
+        ("local", temp_dir, {"name": os.path.basename(temp_dir), "type": "dir"})
+    ]
+    prepared.extend(item for item in move_buffer if not is_supported_archive(item[1]))
+    return prepared, False, temp_dir
+
+
+def ftp_explorer_loop(stdscr, ftp, local_start_path=None, remote_start_path="/"):
     try:
         curses.curs_set(0)
     except curses.error:
         pass
-    current_path = normalize_remote_path(start_path)
-    selected = 0
+    local_root = validate_local_explorer_dir(local_start_path or ".")
+    local_path = local_root
+    remote_path = normalize_remote_path(remote_start_path)
+    local_selected = 0
+    remote_selected = 0
+    active_side = "local"
     message = ""
-    entries = [{"name": "..", "type": "dir", "size": None, "modify": None}]
+    local_entries = [{"name": "..", "type": "dir", "size": None, "modify": None}]
+    remote_entries = [{"name": "..", "type": "dir", "size": None, "modify": None}]
     selected_paths = set()
     shift_selected_paths = set()
     shift_selecting = False
     move_buffer = []
-    restore_selection_name = None
 
     while True:
-        draw_ftp_explorer(
-            stdscr,
-            current_path,
-            entries,
-            selected,
-            "Loading directory...",
-            metadata_loading=True,
-            selected_paths=selected_paths | shift_selected_paths,
-            move_buffer=move_buffer,
-        )
         try:
-            entries = list_ftp_directory(ftp, current_path)
+            local_entries = list_local_directory(local_path, local_root)
+            remote_entries = list_ftp_directory(ftp, remote_path)
             message = ""
-        except ftplib.all_errors as exc:
-            message = f"Could not list {current_path}: {exc}"
-            entries = [{"name": "..", "type": "dir", "size": None, "modify": None}]
-
-        if restore_selection_name is not None:
-            selected = restored_ftp_selection(entries, restore_selection_name, selected)
-            restore_selection_name = None
-        else:
-            selected = restored_ftp_selection(entries, None, selected)
+        except ftplib.all_errors + (OSError,) as exc:
+            message = f"Could not list directory: {exc}"
+        local_selected = restored_ftp_selection(local_entries, None, local_selected)
+        remote_selected = restored_ftp_selection(remote_entries, None, remote_selected)
         while True:
             draw_ftp_explorer(
                 stdscr,
-                current_path,
-                entries,
-                selected,
+                local_path,
+                local_entries,
+                local_selected,
+                remote_path,
+                remote_entries,
+                remote_selected,
+                active_side,
                 message,
                 selected_paths=selected_paths | shift_selected_paths,
                 move_buffer=move_buffer,
             )
             key = stdscr.getch()
             message = ""
+            current_path, entries, selected = active_explorer_state(
+                active_side, local_path, local_entries, local_selected, remote_path, remote_entries, remote_selected
+            )
 
             if key in (ord("q"), ord("Q")):
                 return
+            if key in (ord("\t"), curses.KEY_LEFT, curses.KEY_RIGHT, ord("h"), ord("l")):
+                active_side = "remote" if active_side == "local" else "local"
+                shift_selected_paths = set()
+                shift_selecting = False
+                continue
             if key in (curses.KEY_UP, ord("k")):
                 selected = max(0, selected - 1)
+                if active_side == "local":
+                    local_selected = selected
+                else:
+                    remote_selected = selected
                 shift_selected_paths = set()
                 shift_selecting = False
                 continue
             if key in (curses.KEY_DOWN, ord("j")):
                 selected = min(len(entries) - 1, selected + 1)
+                if active_side == "local":
+                    local_selected = selected
+                else:
+                    remote_selected = selected
                 shift_selected_paths = set()
                 shift_selecting = False
                 continue
@@ -823,25 +1212,34 @@ def ftp_explorer_loop(stdscr, ftp, start_path="/"):
                     selected_paths = set()
                     shift_selected_paths = set()
                     shift_selecting = True
-                selected, shift_selected_paths = move_ftp_selection(current_path, entries, selected, shift_selected_paths, -1)
+                selected, shift_selected_paths = move_explorer_selection(active_side, current_path, entries, selected, shift_selected_paths, -1)
+                if active_side == "local":
+                    local_selected = selected
+                else:
+                    remote_selected = selected
                 continue
             if key in (getattr(curses, "KEY_SF", -1), ord("J")):
                 if not shift_selecting:
                     selected_paths = set()
                     shift_selected_paths = set()
                     shift_selecting = True
-                selected, shift_selected_paths = move_ftp_selection(current_path, entries, selected, shift_selected_paths, 1)
+                selected, shift_selected_paths = move_explorer_selection(active_side, current_path, entries, selected, shift_selected_paths, 1)
+                if active_side == "local":
+                    local_selected = selected
+                else:
+                    remote_selected = selected
                 continue
             if key == ord(" "):
                 entry = entries[selected]
                 if entry["name"] == "..":
                     message = "Cannot select parent entry."
                     continue
-                path = join_ftp_explorer_path(current_path, entry["name"])
-                if path in selected_paths:
-                    selected_paths.remove(path)
+                path = explorer_join_path(active_side, current_path, entry["name"])
+                selection_key = (active_side, path)
+                if selection_key in selected_paths:
+                    selected_paths.remove(selection_key)
                 else:
-                    selected_paths.add(path)
+                    selected_paths.add(selection_key)
                 shift_selected_paths = set()
                 shift_selecting = False
                 continue
@@ -850,7 +1248,7 @@ def ftp_explorer_loop(stdscr, ftp, start_path="/"):
                 message = "Move canceled."
                 continue
             if key == ord("m"):
-                items = selectable_ftp_entries(current_path, entries, selected, selected_paths | shift_selected_paths)
+                items = selected_explorer_items(active_side, current_path, entries, selected, selected_paths | shift_selected_paths)
                 if not items:
                     message = "Select a file or directory to move."
                     continue
@@ -868,14 +1266,52 @@ def ftp_explorer_loop(stdscr, ftp, start_path="/"):
                 if key == ord("P"):
                     entry = entries[selected]
                     if entry["type"] == "dir" and entry["name"] != "..":
-                        destination_dir = join_ftp_explorer_path(current_path, entry["name"])
-                description = f"Move {len(move_buffer)} item(s) to {destination_dir}?"
+                        destination_dir = explorer_join_path(active_side, current_path, entry["name"])
+                cross_pane = move_buffer and move_buffer[0][0] != active_side
+                verb = "Copy" if cross_pane else "Move"
+                description = f"{verb} {len(move_buffer)} item(s) to {destination_dir}?"
                 if not prompt_ftp_confirmation(stdscr, description):
                     message = "Move canceled."
                     continue
+                cleanup_dir = None
                 try:
-                    moved = move_ftp_paths(ftp, move_buffer, destination_dir)
-                    message = f"Moved {len(moved)} item(s)."
+                    prepared_buffer, skip_archives, cleanup_dir = prepare_explorer_transfer_items(stdscr, move_buffer, active_side)
+                    if prepared_buffer is None:
+                        message = "Transfer canceled."
+                        continue
+                    draw_ftp_explorer(
+                        stdscr,
+                        local_path,
+                        local_entries,
+                        local_selected,
+                        remote_path,
+                        remote_entries,
+                        remote_selected,
+                        active_side,
+                        message,
+                        selected_paths=selected_paths | shift_selected_paths,
+                        move_buffer=move_buffer,
+                    )
+                    progress = None
+                    if prepared_buffer and prepared_buffer[0][0] != active_side:
+                        progress = lambda label, sent, total, item_index, item_total: draw_transfer_progress(
+                            stdscr,
+                            label,
+                            sent,
+                            total,
+                            item_index,
+                            item_total,
+                        )
+                    moved = copy_or_move_explorer_items(
+                        ftp,
+                        prepared_buffer,
+                        active_side,
+                        destination_dir,
+                        skip_archives=skip_archives,
+                        progress=progress,
+                    )
+                    action = "Copied" if prepared_buffer and prepared_buffer[0][0] != active_side else "Moved"
+                    message = f"{action} {len(moved)} item(s)."
                     move_buffer = []
                     selected_paths = set()
                     shift_selected_paths = set()
@@ -884,24 +1320,31 @@ def ftp_explorer_loop(stdscr, ftp, start_path="/"):
                 except ftplib.all_errors + (OSError, FTPTransferError) as exc:
                     message = f"Move failed: {exc}"
                     continue
+                finally:
+                    if cleanup_dir is not None:
+                        shutil.rmtree(cleanup_dir, ignore_errors=True)
             if key == ord("d"):
-                items = selectable_ftp_entries(current_path, entries, selected, selected_paths | shift_selected_paths)
+                items = selected_explorer_items(active_side, current_path, entries, selected, selected_paths | shift_selected_paths)
                 if not items:
                     message = "Select a file or directory to delete."
                     continue
-                names = ", ".join(path for path, _ in items[:3])
+                names = ", ".join(path for _, path, _ in items[:3])
                 suffix = "..." if len(items) > 3 else ""
                 description = f"Delete {len(items)} item(s): {names}{suffix}?"
                 if not prompt_ftp_confirmation(stdscr, description):
                     message = "Delete canceled."
                     continue
                 try:
-                    for path, entry in items:
-                        delete_ftp_path(ftp, path, entry["type"])
+                    for side, path, entry in items:
+                        if side == "local":
+                            delete_local_path(path, entry["type"])
+                        else:
+                            delete_ftp_path(ftp, path, entry["type"])
                     selected_paths = set()
                     shift_selected_paths = set()
                     shift_selecting = False
-                    move_buffer = [(path, entry) for path, entry in move_buffer if path not in {item_path for item_path, _ in items}]
+                    deleted_keys = {(side, path) for side, path, _ in items}
+                    move_buffer = [(side, path, entry) for side, path, entry in move_buffer if (side, path) not in deleted_keys]
                     message = f"Deleted {len(items)} item(s)."
                     break
                 except ftplib.all_errors + (OSError,) as exc:
@@ -911,9 +1354,15 @@ def ftp_explorer_loop(stdscr, ftp, start_path="/"):
                 if current_path == "/":
                     message = "Already at root."
                     continue
-                previous_path = current_path
-                current_path = join_ftp_explorer_path(current_path, "..")
-                restore_selection_name = posixpath.basename(previous_path.rstrip("/"))
+                if active_side == "local":
+                    if local_path == local_root:
+                        message = "Already at local start directory."
+                        continue
+                    local_path = join_local_explorer_path(local_path, "..", local_root)
+                    local_selected = 0
+                else:
+                    remote_path = join_ftp_explorer_path(remote_path, "..")
+                    remote_selected = 0
                 selected_paths = set()
                 shift_selected_paths = set()
                 shift_selecting = False
@@ -921,30 +1370,31 @@ def ftp_explorer_loop(stdscr, ftp, start_path="/"):
             if key in (curses.KEY_ENTER, 10, 13):
                 entry = entries[selected]
                 if entry["type"] == "dir":
-                    previous_path = current_path
-                    current_path = join_ftp_explorer_path(current_path, entry["name"])
-                    if entry["name"] == "..":
-                        restore_selection_name = posixpath.basename(previous_path.rstrip("/"))
+                    if active_side == "local":
+                        local_path = join_local_explorer_path(local_path, entry["name"], local_root)
+                        local_selected = 0
                     else:
-                        selected = 0
-                        restore_selection_name = None
+                        remote_path = join_ftp_explorer_path(remote_path, entry["name"])
+                        remote_selected = 0
                     selected_paths = set()
                     shift_selected_paths = set()
                     shift_selecting = False
                     break
-                message = "Selected file. Use FTP upload for transfers."
+                message = "Selected file. Press m to stage it for moving."
 
 
 def run_ftp_explorer(args):
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         raise FTPTransferError("FTP explorer requires an interactive terminal")
 
+    local_start_path = validate_local_explorer_dir(getattr(args, "source", "."))
+    remote_start_path = normalize_remote_path(getattr(args, "dest", "/"))
     host, port = resolve_ftp_host(args.host, args.port)
     try:
         with ftplib.FTP() as ftp:
             ftp.connect(host, port, timeout=DEFAULT_TIMEOUT)
             ftp.set_pasv(True)
             ftp.login(user=args.user, passwd=args.password)
-            curses.wrapper(ftp_explorer_loop, ftp, "/")
+            curses.wrapper(ftp_explorer_loop, ftp, local_start_path, remote_start_path)
     except ftplib.all_errors + (OSError,) as exc:
         raise FTPTransferError(f"FTP explorer failed for {host}:{port}: {exc}") from exc

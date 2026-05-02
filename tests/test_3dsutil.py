@@ -87,7 +87,7 @@ class ParseArgsTests(unittest.TestCase):
         self.assertEqual(args.patterns, ["*.nds", "*.gba"])
 
     def test_parse_args_ftp_defaults_to_explorer(self):
-        args = three_dsutil.parse_args(["ftp", "--host", "192.168.0.10"])
+        args = three_dsutil.parse_args(["ftp", "--host", "192.168.0.10", "--source", "~/Downloads", "--dest", "/3ds"])
 
         self.assertEqual(args.command, three_dsutil.FTP_COMMAND)
         self.assertEqual(args.action, three_dsutil.EXPLORER_ACTION)
@@ -96,15 +96,25 @@ class ParseArgsTests(unittest.TestCase):
         self.assertEqual(args.port, three_dsutil.DEFAULT_FTP_PORT)
         self.assertEqual(args.user, "anonymous")
         self.assertEqual(args.password, "")
+        self.assertEqual(args.source, "~/Downloads")
+        self.assertEqual(args.dest, "/3ds")
 
     def test_parse_args_accepts_explicit_ftp_explorer(self):
-        args = three_dsutil.parse_args(["ftp", "explorer", "--host", "192.168.0.10", "--port", "6000"])
+        args = three_dsutil.parse_args([
+            "ftp", "explorer",
+            "--host", "192.168.0.10",
+            "--port", "6000",
+            "--source", "~/Downloads",
+            "--dest", "/roms",
+        ])
 
         self.assertEqual(args.command, three_dsutil.FTP_COMMAND)
         self.assertEqual(args.action, three_dsutil.EXPLORER_ACTION)
         self.assertFalse(args.legacy)
         self.assertEqual(args.host, "192.168.0.10")
         self.assertEqual(args.port, 6000)
+        self.assertEqual(args.source, "~/Downloads")
+        self.assertEqual(args.dest, "/roms")
 
     def test_parse_args_accepts_explicit_ftp_upload(self):
         args = three_dsutil.parse_args([
@@ -155,12 +165,13 @@ class ParseArgsTests(unittest.TestCase):
         self.assertEqual(args.host, "192.168.0.10")
 
     def test_parse_args_accepts_install_command(self):
-        args = three_dsutil.parse_args(["install", "--install-root", "/tmp/3dsutil", "--bin-dir", "/tmp/bin"])
+        args = three_dsutil.parse_args(["install", "--install-root", "/tmp/3dsutil", "--bin-dir", "/tmp/bin", "--ref", "1.1"])
 
         self.assertEqual(args.command, three_dsutil.INSTALL_COMMAND)
         self.assertFalse(args.legacy)
         self.assertEqual(args.install_root, "/tmp/3dsutil")
         self.assertEqual(args.bin_dir, "/tmp/bin")
+        self.assertEqual(args.ref, "1.1")
 
     def test_parse_args_accepts_uninstall_command(self):
         args = three_dsutil.parse_args(["uninstall", "--install-root", "/tmp/3dsutil", "--bin-dir", "/tmp/bin"])
@@ -599,6 +610,46 @@ class FTPTransferTests(unittest.TestCase):
     def test_format_size_uses_binary_units(self):
         self.assertEqual(three_dsutil.format_size("1536"), "1.5 KiB")
 
+    def test_validate_local_explorer_dir_expands_home_and_requires_directory(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self.assertEqual(three_dsutil.validate_local_explorer_dir(temp_dir), os.path.abspath(temp_dir))
+
+        with tempfile.NamedTemporaryFile() as file_obj:
+            with self.assertRaises(three_dsutil.FTPTransferError):
+                three_dsutil.validate_local_explorer_dir(file_obj.name)
+
+    def test_list_local_directory_omits_parent_at_start_dir(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with open(os.path.join(temp_dir, "game.nds"), "w") as file_obj:
+                file_obj.write("game")
+
+            entries = three_dsutil.list_local_directory(temp_dir, temp_dir)
+
+        self.assertEqual([entry["name"] for entry in entries], ["game.nds"])
+
+    def test_list_local_directory_includes_parent_below_start_dir(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            nested = os.path.join(temp_dir, "nested")
+            os.mkdir(nested)
+            with open(os.path.join(nested, "game.nds"), "w") as file_obj:
+                file_obj.write("game")
+
+            entries = three_dsutil.list_local_directory(nested, temp_dir)
+
+        self.assertEqual([entry["name"] for entry in entries], ["..", "game.nds"])
+
+    def test_join_local_explorer_path_goes_up_from_nested_dir(self):
+        self.assertEqual(
+            three_dsutil.join_local_explorer_path("/tmp/example/nested", ".."),
+            "/tmp/example",
+        )
+
+    def test_join_local_explorer_path_stays_inside_start_dir(self):
+        self.assertEqual(
+            three_dsutil.join_local_explorer_path("/tmp/example", "..", "/tmp/example"),
+            "/tmp/example",
+        )
+
     def test_join_ftp_explorer_path_goes_up_from_nested_dir(self):
         self.assertEqual(three_dsutil.join_ftp_explorer_path("/roms/gba", ".."), "/roms")
         self.assertEqual(three_dsutil.join_ftp_explorer_path("/", ".."), "/")
@@ -624,6 +675,18 @@ class FTPTransferTests(unittest.TestCase):
 
         self.assertEqual(selected, 2)
         self.assertEqual(selected_paths, {"/roms/first.nds", "/roms/second.nds"})
+
+    def test_move_explorer_selection_tracks_side_with_paths(self):
+        entries = [
+            {"name": "..", "type": "dir"},
+            {"name": "first.nds", "type": "file"},
+            {"name": "second.nds", "type": "file"},
+        ]
+
+        selected, selected_paths = three_dsutil.move_explorer_selection("remote", "/roms", entries, 1, set(), 1)
+
+        self.assertEqual(selected, 2)
+        self.assertEqual(selected_paths, {("remote", "/roms/first.nds"), ("remote", "/roms/second.nds")})
 
     def test_restored_ftp_selection_selects_returned_directory(self):
         entries = [
@@ -665,6 +728,111 @@ class FTPTransferTests(unittest.TestCase):
                 [("/roms", {"name": "roms", "type": "dir"})],
                 "/roms/nested",
             )
+
+    def test_copy_or_move_explorer_items_dispatches_local_to_remote_copy(self):
+        ftp = mock.MagicMock()
+        item = ("local", "/tmp/game.nds", {"name": "game.nds", "type": "file"})
+
+        with mock.patch.object(ftp_module, "copy_local_paths_to_remote", return_value=[("/tmp/game.nds", "/3ds/game.nds")]) as move_mock:
+            moved = three_dsutil.copy_or_move_explorer_items(ftp, [item], "remote", "/3ds")
+
+        self.assertEqual(moved, [("/tmp/game.nds", "/3ds/game.nds")])
+        move_mock.assert_called_once_with(
+            ftp,
+            [("/tmp/game.nds", {"name": "game.nds", "type": "file"})],
+            "/3ds",
+            skip_archives=False,
+            progress=None,
+        )
+
+    def test_copy_or_move_explorer_items_dispatches_remote_to_local_copy(self):
+        ftp = mock.MagicMock()
+        item = ("remote", "/3ds/game.nds", {"name": "game.nds", "type": "file"})
+
+        with mock.patch.object(ftp_module, "copy_remote_paths_to_local", return_value=[("/3ds/game.nds", "/tmp/game.nds")]) as move_mock:
+            moved = three_dsutil.copy_or_move_explorer_items(ftp, [item], "local", "/tmp")
+
+        self.assertEqual(moved, [("/3ds/game.nds", "/tmp/game.nds")])
+        move_mock.assert_called_once_with(
+            ftp,
+            [("/3ds/game.nds", {"name": "game.nds", "type": "file"})],
+            "/tmp",
+            progress=None,
+        )
+
+    def test_copy_local_paths_to_remote_skips_archives_inside_directories(self):
+        ftp = mock.MagicMock()
+        with tempfile.TemporaryDirectory() as source_dir:
+            archive_path = os.path.join(source_dir, "roms.zip")
+            keep_path = os.path.join(source_dir, "game.nds")
+            with open(archive_path, "wb") as file_obj:
+                file_obj.write(b"archive")
+            with open(keep_path, "wb") as file_obj:
+                file_obj.write(b"game")
+
+            with mock.patch.object(ftp_module, "remote_size", return_value=None), \
+                mock.patch.object(ftp_module, "upload_ftp_file") as upload_mock:
+                three_dsutil.copy_local_paths_to_remote(
+                    ftp,
+                    [(source_dir, {"name": os.path.basename(source_dir), "type": "dir"})],
+                    "/dest",
+                    skip_archives=True,
+                )
+
+        uploaded_paths = [call.args[2] for call in upload_mock.call_args_list]
+        self.assertEqual(uploaded_paths, ["/dest/" + os.path.basename(source_dir) + "/game.nds"])
+
+    def test_upload_local_path_to_remote_skips_same_size_file(self):
+        ftp = mock.MagicMock()
+        with tempfile.NamedTemporaryFile() as file_obj:
+            file_obj.write(b"same")
+            file_obj.flush()
+
+            with mock.patch.object(ftp_module, "remote_size", return_value=os.path.getsize(file_obj.name)), \
+                mock.patch.object(ftp_module, "upload_ftp_file") as upload_mock:
+                destination = three_dsutil.upload_local_path_to_remote(ftp, file_obj.name, "/dest")
+
+        self.assertIsNone(destination)
+        upload_mock.assert_not_called()
+
+    def test_upload_local_path_to_remote_renames_different_size_file(self):
+        ftp = mock.MagicMock()
+        with tempfile.NamedTemporaryFile() as file_obj:
+            file_obj.write(b"new")
+            file_obj.flush()
+
+            with mock.patch.object(ftp_module, "remote_size", side_effect=[999, None]), \
+                mock.patch.object(ftp_module, "upload_ftp_file") as upload_mock:
+                destination = three_dsutil.upload_local_path_to_remote(ftp, file_obj.name, "/dest")
+
+        self.assertTrue(destination.endswith("_1" + os.path.splitext(file_obj.name)[1]))
+        upload_mock.assert_called_once()
+
+    def test_download_remote_path_to_local_skips_same_size_file(self):
+        ftp = mock.MagicMock()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            destination = os.path.join(temp_dir, "game.nds")
+            with open(destination, "wb") as file_obj:
+                file_obj.write(b"same")
+
+            with mock.patch.object(ftp_module, "remote_size", return_value=os.path.getsize(destination)):
+                result = three_dsutil.download_remote_path_to_local(ftp, "/roms/game.nds", "file", temp_dir)
+
+        self.assertIsNone(result)
+        ftp.retrbinary.assert_not_called()
+
+    def test_download_remote_path_to_local_renames_different_size_file(self):
+        ftp = mock.MagicMock()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            destination = os.path.join(temp_dir, "game.nds")
+            with open(destination, "wb") as file_obj:
+                file_obj.write(b"old")
+
+            with mock.patch.object(ftp_module, "remote_size", return_value=999):
+                result = three_dsutil.download_remote_path_to_local(ftp, "/roms/game.nds", "file", temp_dir)
+
+        self.assertEqual(os.path.basename(result), "game_1.nds")
+        ftp.retrbinary.assert_called_once()
 
     def test_delete_ftp_path_deletes_files_directly(self):
         ftp = mock.MagicMock()
@@ -784,6 +952,7 @@ class ManagementCommandTests(unittest.TestCase):
         return argparse.Namespace(
             command=command,
             repo_url="https://example.test/3dsutil.py.git",
+            ref="",
             install_root=os.path.join(temp_dir, "lib", "3dsutil.py"),
             bin_dir=os.path.join(temp_dir, "bin"),
             python=sys.executable,
@@ -815,6 +984,21 @@ class ManagementCommandTests(unittest.TestCase):
             run_mock.assert_called_once_with(["git", "clone", args.repo_url, args.install_root], check=True)
             self.assertTrue(os.path.exists(os.path.join(args.bin_dir, "3dsutil")))
 
+    def test_run_install_checks_out_ref_when_requested(self):
+        with tempfile.TemporaryDirectory() as temp_dir, \
+            mock.patch.object(three_dsutil, "ensure_git_available"), \
+            mock.patch.object(three_dsutil.subprocess, "run") as run_mock:
+            args = self.make_args(temp_dir)
+            args.ref = "1.1"
+
+            three_dsutil.run_install(args)
+
+            run_mock.assert_has_calls([
+                mock.call(["git", "clone", args.repo_url, args.install_root], check=True),
+                mock.call(["git", "-C", args.install_root, "fetch", "--tags", "--force"], check=True),
+                mock.call(["git", "-C", args.install_root, "checkout", "1.1"], check=True),
+            ])
+
     def test_run_update_pulls_existing_checkout_and_rewrites_launcher(self):
         with tempfile.TemporaryDirectory() as temp_dir, \
             mock.patch.object(three_dsutil, "ensure_git_available") as git_mock, \
@@ -827,6 +1011,22 @@ class ManagementCommandTests(unittest.TestCase):
             git_mock.assert_called_once()
             run_mock.assert_called_once_with(["git", "-C", args.install_root, "pull", "--ff-only"], check=True)
             self.assertTrue(os.path.exists(os.path.join(args.bin_dir, "3dsutil")))
+
+    def test_run_update_checks_out_ref_when_requested(self):
+        with tempfile.TemporaryDirectory() as temp_dir, \
+            mock.patch.object(three_dsutil, "ensure_git_available"), \
+            mock.patch.object(three_dsutil.subprocess, "run") as run_mock:
+            args = self.make_args(temp_dir, command=three_dsutil.UPDATE_COMMAND)
+            args.ref = "1.1"
+            os.makedirs(os.path.join(args.install_root, ".git"))
+
+            three_dsutil.run_update(args)
+
+            run_mock.assert_has_calls([
+                mock.call(["git", "-C", args.install_root, "pull", "--ff-only"], check=True),
+                mock.call(["git", "-C", args.install_root, "fetch", "--tags", "--force"], check=True),
+                mock.call(["git", "-C", args.install_root, "checkout", "1.1"], check=True),
+            ])
 
     def test_run_update_rejects_missing_checkout(self):
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -7,7 +7,8 @@ It is especially useful when a newly modded 3DS does not yet have core apps such
 It supports:
 
 - NetLoader uploads for launching one `.3dsx` from the Homebrew Launcher.
-- FTP browsing and uploads for a 3DS FTP server such as ftpd.
+- Side-by-side local and 3DS FTP browsing, uploads, downloads, copies, and moves for a 3DS FTP server such as ftpd.
+- FTP uploads can extract `.zip` and `.7z` archives before transfer, which is useful because ROMs are often distributed inside archives.
 
 ## Requirements
 
@@ -18,10 +19,16 @@ It supports:
 
 ## Installation
 
-Install the `3dsutil` command with:
+Install the latest version of the `3dsutil` command with:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/spkskx/3dsutil/main/install.sh | sh
+```
+
+Install a specific tagged version with:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/spkskx/3dsutil/main/install.sh | INSTALL_REF=1.1 sh
 ```
 
 The installer checks for Python 3 and git. If either is missing, it asks before running a package-manager install command for `apt-get`, `dnf`, `pacman`, or Homebrew.
@@ -37,13 +44,16 @@ After installation:
 3dsutil uninstall --help
 3dsutil netloader --help
 3dsutil ftp --help
+3dsutil ftp explorer --help
 ```
 
 Once Python and git are available, the CLI can manage itself:
 
 ```bash
 3dsutil install
+3dsutil install --ref 1.1
 3dsutil update
+3dsutil update --ref 1.1
 3dsutil uninstall
 ```
 
@@ -73,6 +83,7 @@ Common commands:
 3dsutil netloader status --host 172.20.10.12
 
 3dsutil ftp --host 172.20.10.12
+3dsutil ftp explorer --host 172.20.10.12 --source . --dest /3ds/
 3dsutil ftp upload --host 172.20.10.12 --source sample-app.3dsx --dest /3ds/
 3dsutil ftp upload --host 172.20.10.12 --source first.nds --source second.gba --dest /roms/
 3dsutil ftp upload --host 172.20.10.12 --source roms.zip --dest /roms/ --unarchive --patterns "*.nds"

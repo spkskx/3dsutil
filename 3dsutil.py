@@ -150,6 +150,12 @@ def add_ftp_status_arguments(parser):
     add_ftp_connection_arguments(parser)
 
 
+def add_ftp_explorer_arguments(parser):
+    parser.add_argument("--source", default=".", help="Local starting directory. Default: current directory")
+    parser.add_argument("--dest", default="/", help="Remote 3DS starting directory. Default: /")
+    add_ftp_connection_arguments(parser)
+
+
 def validate_port(parser, port, option="--port"):
     if not 1 <= port <= 65535:
         parser.error(f"{option} must be between 1 and 65535")
@@ -224,6 +230,8 @@ def parse_args(argv):
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     add_ftp_connection_arguments(ftp_parser)
+    ftp_parser.add_argument("--source", default=".", help="Local starting directory for explorer. Default: current directory")
+    ftp_parser.add_argument("--dest", default="/", help="Remote 3DS starting directory for explorer. Default: /")
 
     install_parser = subparsers.add_parser(INSTALL_COMMAND, help="Install the 3dsutil command")
     add_install_arguments(install_parser)
@@ -289,8 +297,8 @@ def parse_args(argv):
             argv[2:],
             FTP_COMMAND,
             EXPLORER_ACTION,
-            add_ftp_connection_arguments,
-            "Browse files and directories through FTP.",
+            add_ftp_explorer_arguments,
+            "Browse local and 3DS files side by side through FTP.",
             "3dsutil ftp explorer",
         )
 
@@ -344,6 +352,7 @@ def parse_args(argv):
 
 def add_install_arguments(parser):
     parser.add_argument("--repo-url", default=os.environ.get("REPO_URL", DEFAULT_REPO_URL), help=f"Git repository URL. Default: {DEFAULT_REPO_URL}")
+    parser.add_argument("--ref", default=os.environ.get("INSTALL_REF", ""), help="Git branch, tag, or commit to check out after install or update")
     parser.add_argument("--install-root", default=os.environ.get("INSTALL_ROOT", DEFAULT_INSTALL_ROOT), help=f"Install source directory. Default: {DEFAULT_INSTALL_ROOT}")
     parser.add_argument("--bin-dir", default=os.environ.get("BIN_DIR", DEFAULT_BIN_DIR), help=f"Launcher directory. Default: {DEFAULT_BIN_DIR}")
     parser.add_argument("--python", default=os.environ.get("PYTHON", sys.executable), help=f"Python executable for the launcher. Default: {sys.executable}")
@@ -484,6 +493,10 @@ def run_install(args):
             raise NetloaderError(f"install root already exists and is not a git checkout: {install_root}")
         subprocess.run(["git", "clone", args.repo_url, install_root], check=True)
 
+    if args.ref:
+        subprocess.run(["git", "-C", install_root, "fetch", "--tags", "--force"], check=True)
+        subprocess.run(["git", "-C", install_root, "checkout", args.ref], check=True)
+
     path = write_launcher(args.bin_dir, install_root, args.python)
     print(f"Installed 3dsutil to {path}")
     print("Run: 3dsutil --help")
@@ -513,6 +526,9 @@ def run_update(args):
         raise NetloaderError(f"install root is not a git checkout: {install_root}. Run '3dsutil install' first")
 
     subprocess.run(["git", "-C", install_root, "pull", "--ff-only"], check=True)
+    if args.ref:
+        subprocess.run(["git", "-C", install_root, "fetch", "--tags", "--force"], check=True)
+        subprocess.run(["git", "-C", install_root, "checkout", args.ref], check=True)
     path = write_launcher(args.bin_dir, install_root, args.python)
     print(f"Updated 3dsutil in {install_root}")
     print(f"Launcher: {path}")

@@ -2,6 +2,7 @@
 set -eu
 
 REPO_URL="${REPO_URL:-https://github.com/spkskx/3dsutil.git}"
+INSTALL_REF="${INSTALL_REF:-}"
 INSTALL_ROOT="${INSTALL_ROOT:-$HOME/.local/lib/3dsutil.py}"
 BIN_DIR="${BIN_DIR:-$HOME/.local/bin}"
 PYTHON="${PYTHON:-python3}"
@@ -101,6 +102,12 @@ else
     rm -rf "$INSTALL_ROOT"
     say "Installing into $INSTALL_ROOT"
     git clone "$REPO_URL" "$INSTALL_ROOT"
+fi
+
+if [ -n "$INSTALL_REF" ]; then
+    say "Checking out $INSTALL_REF"
+    git -C "$INSTALL_ROOT" fetch --tags --force
+    git -C "$INSTALL_ROOT" checkout "$INSTALL_REF"
 fi
 
 cat > "$BIN_DIR/3dsutil" <<EOF
