@@ -19,7 +19,7 @@ It supports:
 Install the `3dsutil` command with:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/spkskx/3dslink.py/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/spkskx/3dsutil/main/install.sh | sh
 ```
 
 The installer checks for Python 3 and git. If either is missing, it asks before running a package-manager install command for `apt-get`, `dnf`, `pacman`, or Homebrew.

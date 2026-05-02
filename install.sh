@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-REPO_URL="${REPO_URL:-https://github.com/spkskx/3dslink.py.git}"
+REPO_URL="${REPO_URL:-https://github.com/spkskx/3dsutil.git}"
 INSTALL_ROOT="${INSTALL_ROOT:-$HOME/.local/lib/3dsutil.py}"
 BIN_DIR="${BIN_DIR:-$HOME/.local/bin}"
 PYTHON="${PYTHON:-python3}"

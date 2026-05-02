@@ -33,7 +33,7 @@ from netloader import *
 from ftp import *
 
 
-DEFAULT_REPO_URL = "https://github.com/spkskx/3dslink.py.git"
+DEFAULT_REPO_URL = "https://github.com/spkskx/3dsutil.git"
 DEFAULT_INSTALL_ROOT = os.path.expanduser("~/.local/lib/3dsutil.py")
 DEFAULT_BIN_DIR = os.path.expanduser("~/.local/bin")
 LAUNCHER_NAME = "3dsutil"
