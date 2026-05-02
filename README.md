@@ -1,8 +1,8 @@
 # 3dsutil
 
-`3dsutil` is a small, dependency-free Python utility for moving homebrew files from your computer to a modded 3DS over Wi-Fi.
+`3dsutil` is a small, dependency-free Python utility for wirelessly moving homebrew files from your computer to a modded 3DS on the same network.
 
-It is especially useful when a newly modded 3DS does not yet have core apps such as ftpd, Universal-Updater, or FBI, and you cannot easily copy files with an SD card reader. Connect the 3DS to Wi-Fi, use NetLoader to upload and launch Universal-Updater, then finish the rest of the setup directly on the console.
+It is especially useful when a newly modded 3DS does not yet have core apps such as ftpd, Universal-Updater, or FBI, and you cannot easily copy files with an SD card reader. Connect the 3DS to your network, wirelessly upload and launch Universal-Updater with NetLoader, then finish the rest of the setup directly on the console.
 
 It supports:
 

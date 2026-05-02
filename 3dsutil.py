@@ -187,7 +187,7 @@ def parse_args(argv):
     argv = list(argv)
     parser = argparse.ArgumentParser(
         prog=CLI_PROG,
-        description="3dsutil: transfer, browse, and manage files on a modded 3DS over Wi-Fi.",
+        description="3dsutil: wirelessly transfer, browse, and manage files on a modded 3DS on the same network.",
         epilog=(
             "Common commands:\n"
             "  3dsutil netloader sample-app.3dsx\n"

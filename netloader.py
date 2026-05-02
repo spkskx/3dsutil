@@ -161,7 +161,7 @@ def send_3dsx(host, port, path):
             sock.shutdown(socket.SHUT_WR)
     except socket.timeout as exc:
         raise NetloaderError(
-            f"timed out while talking to {host}:{port}. Make sure NetLoader is open and the 3DS stays on the same Wi-Fi"
+            f"timed out while talking to {host}:{port}. Make sure NetLoader is open and the 3DS stays on the same network"
         ) from exc
     except OSError as exc:
         raise NetloaderError(f"network error while talking to {host}:{port}: {exc}") from exc
@@ -190,4 +190,3 @@ def resolve_netloader_host(args, stdin=None):
 
     resolved_host, resolved_port = parse_host_port(host, args.port, "NetLoader host")
     return resolve_host(resolved_host, resolved_port), resolved_port
-
