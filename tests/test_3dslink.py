@@ -62,25 +62,28 @@ class ParseArgsTests(unittest.TestCase):
         self.assertEqual(args.file, "sample-app.3dsx")
 
     def test_parse_args_accepts_explicit_ftp_defaults(self):
-        args = three_dslink.parse_args(["ftp", "sample-app.3dsx"])
+        args = three_dslink.parse_args(["ftp", "--source", "sample-app.3dsx", "--dest", "/3ds/"])
 
         self.assertEqual(args.command, three_dslink.FTP_COMMAND)
         self.assertEqual(args.action, three_dslink.UPLOAD_ACTION)
         self.assertFalse(args.legacy)
-        self.assertEqual(args.file, "sample-app.3dsx")
+        self.assertEqual(args.source, "sample-app.3dsx")
+        self.assertEqual(args.dest, "/3ds/")
         self.assertEqual(args.port, three_dslink.DEFAULT_FTP_PORT)
         self.assertEqual(args.user, "anonymous")
         self.assertEqual(args.password, "")
-        self.assertIsNone(args.remote)
 
     def test_parse_args_accepts_explicit_ftp_upload(self):
-        args = three_dslink.parse_args(["ftp", "upload", "--host", "192.168.0.10", "sample-app.3dsx"])
+        args = three_dslink.parse_args([
+            "ftp", "upload", "--host", "192.168.0.10", "--source", "sample-app.3dsx", "--dest", "/3ds/"
+        ])
 
         self.assertEqual(args.command, three_dslink.FTP_COMMAND)
         self.assertEqual(args.action, three_dslink.UPLOAD_ACTION)
         self.assertFalse(args.legacy)
         self.assertEqual(args.host, "192.168.0.10")
-        self.assertEqual(args.file, "sample-app.3dsx")
+        self.assertEqual(args.source, "sample-app.3dsx")
+        self.assertEqual(args.dest, "/3ds/")
 
     def test_parse_args_rejects_invalid_netloader_port(self):
         with self.assertRaises(SystemExit):
@@ -88,7 +91,7 @@ class ParseArgsTests(unittest.TestCase):
 
     def test_parse_args_rejects_invalid_ftp_port(self):
         with self.assertRaises(SystemExit):
-            three_dslink.parse_args(["ftp", "--port", "70000", "sample-app.3dsx"])
+            three_dslink.parse_args(["ftp", "--port", "70000", "--source", "sample-app.3dsx", "--dest", "/3ds/"])
 
     def test_parse_args_accepts_explicit_netloader_status(self):
         args = three_dslink.parse_args(["netloader", "status", "--host", "192.168.0.10", "--port", "1234"])
@@ -206,10 +209,11 @@ class FTPTransferTests(unittest.TestCase):
         ftp = mock.MagicMock()
         ftp.__enter__.return_value = ftp
         ftp.__exit__.return_value = False
+        ftp.size.side_effect = three_dslink.ftplib.error_perm("550 missing")
 
         with self.make_payload_file() as file_obj, \
             mock.patch.object(three_dslink.ftplib, "FTP", return_value=ftp):
-            three_dslink.send_ftp("192.168.0.10", 5000, file_obj.name, "anonymous", "", None)
+            three_dslink.send_ftp("192.168.0.10", 5000, file_obj.name, "/", "anonymous", "")
 
         ftp.connect.assert_called_once_with("192.168.0.10", 5000, timeout=three_dslink.DEFAULT_TIMEOUT)
         ftp.set_pasv.assert_called_once_with(True)
@@ -221,10 +225,12 @@ class FTPTransferTests(unittest.TestCase):
         ftp = mock.MagicMock()
         ftp.__enter__.return_value = ftp
         ftp.__exit__.return_value = False
+        ftp.cwd.side_effect = three_dslink.ftplib.error_perm("550 not dir")
+        ftp.size.side_effect = three_dslink.ftplib.error_perm("550 missing")
 
         with self.make_payload_file() as file_obj, \
             mock.patch.object(three_dslink.ftplib, "FTP", return_value=ftp):
-            three_dslink.send_ftp("192.168.0.10", 2121, file_obj.name, "user", "secret", "/3ds/app.3dsx")
+            three_dslink.send_ftp("192.168.0.10", 2121, file_obj.name, "/3ds/app.3dsx", "user", "secret")
 
         ftp.connect.assert_called_once_with("192.168.0.10", 2121, timeout=three_dslink.DEFAULT_TIMEOUT)
         ftp.login.assert_called_once_with(user="user", passwd="secret")
@@ -235,11 +241,59 @@ class FTPTransferTests(unittest.TestCase):
         ftp.__enter__.return_value = ftp
         ftp.__exit__.return_value = False
         ftp.storbinary.side_effect = three_dslink.ftplib.error_perm("550 failed")
+        ftp.size.side_effect = three_dslink.ftplib.error_perm("550 missing")
 
         with self.make_payload_file() as file_obj, \
             mock.patch.object(three_dslink.ftplib, "FTP", return_value=ftp), \
             self.assertRaises(three_dslink.FTPTransferError):
-            three_dslink.send_ftp("192.168.0.10", 5000, file_obj.name, "anonymous", "", None)
+            three_dslink.send_ftp("192.168.0.10", 5000, file_obj.name, "/", "anonymous", "")
+
+    def test_send_ftp_skips_file_when_remote_size_matches(self):
+        ftp = mock.MagicMock()
+        ftp.__enter__.return_value = ftp
+        ftp.__exit__.return_value = False
+        ftp.cwd.side_effect = three_dslink.ftplib.error_perm("550 not dir")
+
+        with self.make_payload_file() as file_obj, \
+            mock.patch.object(three_dslink.ftplib, "FTP", return_value=ftp):
+            ftp.size.return_value = os.path.getsize(file_obj.name)
+            three_dslink.send_ftp("192.168.0.10", 5000, file_obj.name, "/remote.bin", "anonymous", "")
+
+        ftp.storbinary.assert_not_called()
+
+    def test_send_ftp_renames_file_when_remote_size_differs(self):
+        ftp = mock.MagicMock()
+        ftp.__enter__.return_value = ftp
+        ftp.__exit__.return_value = False
+        ftp.cwd.side_effect = three_dslink.ftplib.error_perm("550 not dir")
+        ftp.size.side_effect = [999, three_dslink.ftplib.error_perm("550 missing")]
+
+        with self.make_payload_file() as file_obj, \
+            mock.patch.object(three_dslink.ftplib, "FTP", return_value=ftp):
+            three_dslink.send_ftp("192.168.0.10", 5000, file_obj.name, "/remote.bin", "anonymous", "")
+
+        self.assertEqual(ftp.storbinary.call_args.args[0], "STOR /remote_1.bin")
+
+    def test_send_ftp_uploads_directory_contents_to_dest_directory(self):
+        ftp = mock.MagicMock()
+        ftp.__enter__.return_value = ftp
+        ftp.__exit__.return_value = False
+        ftp.size.side_effect = three_dslink.ftplib.error_perm("550 missing")
+
+        with tempfile.TemporaryDirectory() as source_dir, \
+            mock.patch.object(three_dslink.ftplib, "FTP", return_value=ftp):
+            os.mkdir(os.path.join(source_dir, "nested"))
+            first = os.path.join(source_dir, "first.bin")
+            second = os.path.join(source_dir, "nested", "second.bin")
+            with open(first, "wb") as file_obj:
+                file_obj.write(b"first")
+            with open(second, "wb") as file_obj:
+                file_obj.write(b"second")
+
+            three_dslink.send_ftp("192.168.0.10", 5000, source_dir, "/dest", "anonymous", "")
+
+        commands = [call.args[0] for call in ftp.storbinary.call_args_list]
+        self.assertEqual(commands, ["STOR /dest/first.bin", "STOR /dest/nested/second.bin"])
 
 
 class FTPHostResolutionTests(unittest.TestCase):
@@ -274,11 +328,14 @@ class StatusTests(unittest.TestCase):
         sock.__enter__.return_value = sock
         sock.__exit__.return_value = False
 
-        with mock.patch.object(three_dslink.socket, "create_connection", return_value=sock) as connect_mock:
+        with mock.patch.object(three_dslink.socket, "create_connection", return_value=sock) as connect_mock, \
+            mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
             three_dslink.check_tcp_status("192.168.0.10", 17491, "NetLoader")
 
         connect_mock.assert_called_once_with(("192.168.0.10", 17491), timeout=three_dslink.DEFAULT_TIMEOUT)
         sock.settimeout.assert_called_once_with(three_dslink.DEFAULT_TIMEOUT)
+        self.assertIn("NetLoader is reachable at 192.168.0.10:17491", stdout.getvalue())
+        self.assertIn("Restart it before loading a .3dsx file", stdout.getvalue())
 
     def test_check_tcp_status_wraps_socket_errors(self):
         with mock.patch.object(three_dslink.socket, "create_connection", side_effect=OSError("refused")):
@@ -381,17 +438,17 @@ class MainTests(unittest.TestCase):
         args = argparse.Namespace(
             command=three_dslink.FTP_COMMAND,
             legacy=False,
-            file="sample-app.3dsx",
+            source="sample-app.3dsx",
+            dest="/3ds/",
             host="192.168.0.10",
             port=5000,
             user="anonymous",
             password="",
-            remote=None,
         )
 
         with mock.patch.object(three_dslink, "parse_args", return_value=args), \
             mock.patch.object(three_dslink, "run_ftp") as run_mock:
-            result = three_dslink.main(["ftp", "--host", "192.168.0.10", "sample-app.3dsx"])
+            result = three_dslink.main(["ftp", "--host", "192.168.0.10", "--source", "sample-app.3dsx", "--dest", "/3ds/"])
 
         self.assertEqual(result, 0)
         run_mock.assert_called_once_with(args)

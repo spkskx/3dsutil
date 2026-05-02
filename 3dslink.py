@@ -1,6 +1,7 @@
 import argparse
 import ftplib
 import os
+import posixpath
 import socket
 import struct
 import sys
@@ -19,6 +20,7 @@ DEFAULT_DISCOVERY_RETRIES = 10
 DISCOVERY_REQUEST = b"3dsboot"
 DISCOVERY_RESPONSE_PREFIX = b"boot3ds"
 ZLIB_CHUNK = 16 * 1024
+FTP_CHUNK = 16 * 1024
 THREEDSX_MAGIC = b"3DSX"
 MDNS_ADDR = "224.0.0.251"
 MDNS_PORT = 5353
@@ -292,6 +294,13 @@ def validate_input_file(path):
         raise NetloaderError(f"file is empty: {path}")
 
 
+def validate_ftp_source(path):
+    if not os.path.exists(path):
+        raise FTPTransferError(f"source not found: {path}")
+    if not os.path.isfile(path) and not os.path.isdir(path):
+        raise FTPTransferError(f"source is not a file or directory: {path}")
+
+
 def file_has_3dsx_magic(path):
     with open(path, 'rb') as file_obj:
         return file_obj.read(len(THREEDSX_MAGIC)) == THREEDSX_MAGIC
@@ -359,15 +368,157 @@ def send_3dsx(host, port, path):
         raise NetloaderError(f"network error while talking to {host}:{port}: {exc}") from exc
 
 
-def get_ftp_remote_path(path, remote_path):
-    if remote_path:
-        return remote_path
-    return "/" + os.path.basename(path)
+def normalize_remote_path(path):
+    if not path:
+        return "/"
+    normalized = path.replace("\\", "/")
+    if not normalized.startswith("/"):
+        normalized = "/" + normalized
+    return posixpath.normpath(normalized)
 
 
-def send_ftp(host, port, path, user, password, remote_path):
-    validate_input_file(path)
-    destination = get_ftp_remote_path(path, remote_path)
+def remote_parent(path):
+    parent = posixpath.dirname(path)
+    return parent if parent else "/"
+
+
+def join_remote_path(directory, name):
+    return posixpath.normpath(posixpath.join(normalize_remote_path(directory), name))
+
+
+def split_remote_name(path):
+    directory = remote_parent(path)
+    basename = posixpath.basename(path)
+    stem, extension = posixpath.splitext(basename)
+    return directory, stem, extension
+
+
+def remote_size(ftp, path):
+    try:
+        return ftp.size(path)
+    except ftplib.all_errors:
+        return None
+
+
+def remote_is_dir(ftp, path):
+    current = None
+    try:
+        current = ftp.pwd()
+    except ftplib.all_errors:
+        pass
+
+    try:
+        ftp.cwd(path)
+        return True
+    except ftplib.all_errors:
+        return False
+    finally:
+        if current is not None:
+            try:
+                ftp.cwd(current)
+            except ftplib.all_errors:
+                pass
+
+
+def ensure_remote_dir(ftp, path):
+    normalized = normalize_remote_path(path)
+    if normalized == "/":
+        return
+
+    current = ""
+    for part in normalized.strip("/").split("/"):
+        current = current + "/" + part
+        try:
+            ftp.mkd(current)
+        except ftplib.all_errors:
+            pass
+
+
+def iter_ftp_sources(source):
+    if os.path.isfile(source):
+        yield source, os.path.basename(source)
+        return
+
+    for root, dirs, files in os.walk(source):
+        dirs.sort()
+        files.sort()
+        for filename in files:
+            local_path = os.path.join(root, filename)
+            relative_path = os.path.relpath(local_path, source).replace(os.sep, "/")
+            yield local_path, relative_path
+
+
+def make_unique_remote_path(ftp, destination):
+    directory, stem, extension = split_remote_name(destination)
+    index = 1
+    while index <= 999:
+        candidate = posixpath.join(directory, f"{stem}_{index}{extension}")
+        if remote_size(ftp, candidate) is None:
+            return candidate
+        index += 1
+    raise FTPTransferError(f"could not find an unused remote filename for {destination}")
+
+
+def resolve_ftp_destination(ftp, source, dest):
+    destination = normalize_remote_path(dest)
+    source_is_dir = os.path.isdir(source)
+
+    if source_is_dir:
+        ensure_remote_dir(ftp, destination)
+        return destination, True
+
+    if dest.endswith("/") or remote_is_dir(ftp, destination):
+        ensure_remote_dir(ftp, destination)
+        return join_remote_path(destination, os.path.basename(source)), False
+
+    ensure_remote_dir(ftp, remote_parent(destination))
+    return destination, False
+
+
+def print_upload_progress(label, sent, total):
+    if total:
+        percent = min(100, int(sent * 100 / total))
+        print(f"Uploading {label}: {sent}/{total} bytes ({percent}%)")
+    else:
+        print(f"Uploading {label}: {sent} bytes")
+
+
+def upload_ftp_file(ftp, local_path, remote_path):
+    total = os.path.getsize(local_path)
+    sent = 0
+    last_reported_percent = -1
+
+    print(f"Uploading {local_path} -> {remote_path}")
+
+    def report(block):
+        nonlocal sent, last_reported_percent
+        sent += len(block)
+        percent = 100 if not total else int(sent * 100 / total)
+        if percent == 100 or percent >= last_reported_percent + 10:
+            print_upload_progress(posixpath.basename(remote_path), sent, total)
+            last_reported_percent = percent
+
+    with open(local_path, 'rb') as file_obj:
+        ftp.storbinary(f"STOR {remote_path}", file_obj, blocksize=FTP_CHUNK, callback=report)
+
+
+def print_ftp_summary(uploaded, skipped, renamed):
+    print("FTP upload summary:")
+    print(f"Uploaded: {len(uploaded)}")
+    for local_path, remote_path in uploaded:
+        print(f"  {local_path} -> {remote_path}")
+
+    print(f"Skipped: {len(skipped)}")
+    for local_path, remote_path in skipped:
+        print(f"  {local_path} -> {remote_path} (same size)")
+
+    print(f"Uploaded with different name: {len(renamed)}")
+    for local_path, original_path, renamed_path in renamed:
+        print(f"  {local_path} -> {renamed_path} (existing {original_path} has different size)")
+
+
+def send_ftp(host, port, source, dest, user, password):
+    validate_ftp_source(source)
 
     try:
         with ftplib.FTP() as ftp:
@@ -376,9 +527,36 @@ def send_ftp(host, port, path, user, password, remote_path):
             ftp.login(user=user, passwd=password)
 
             print(f"Connected to FTP at {host}:{port}")
-            print(f"Uploading {os.path.basename(path)} to {destination}...")
-            with open(path, 'rb') as file_obj:
-                ftp.storbinary(f"STOR {destination}", file_obj)
+            base_destination, source_is_dir = resolve_ftp_destination(ftp, source, dest)
+            uploaded = []
+            skipped = []
+            renamed = []
+
+            for local_path, relative_path in iter_ftp_sources(source):
+                local_size = os.path.getsize(local_path)
+                if source_is_dir:
+                    destination = join_remote_path(base_destination, relative_path)
+                    ensure_remote_dir(ftp, remote_parent(destination))
+                else:
+                    destination = base_destination
+
+                existing_size = remote_size(ftp, destination)
+                if existing_size == local_size:
+                    print(f"Skipping {local_path}; {destination} already exists with the same size")
+                    skipped.append((local_path, destination))
+                    continue
+                if existing_size is not None and existing_size != local_size:
+                    original_destination = destination
+                    destination = make_unique_remote_path(ftp, destination)
+                    print(f"Remote file size differs; uploading {local_path} as {destination}")
+                    upload_ftp_file(ftp, local_path, destination)
+                    renamed.append((local_path, original_destination, destination))
+                    continue
+
+                upload_ftp_file(ftp, local_path, destination)
+                uploaded.append((local_path, destination))
+
+            print_ftp_summary(uploaded, skipped, renamed)
     except ftplib.all_errors + (OSError,) as exc:
         raise FTPTransferError(f"FTP transfer to {host}:{port} failed: {exc}") from exc
 
@@ -393,6 +571,11 @@ def check_tcp_status(host, port, label):
         raise NetloaderError(f"{label} status check failed for {host}:{port}: {exc}") from exc
 
     print(f"{label} is reachable at {host}:{port}")
+    if label == "NetLoader":
+        print(
+            "NetLoader may stop accepting transfers after a status check. "
+            "Restart it before loading a .3dsx file: press B to go back, then press Y in the Homebrew Launcher."
+        )
 
 
 def check_ftp_status(host, port, user, password):
@@ -422,7 +605,8 @@ def add_netloader_arguments(parser):
 
 
 def add_ftp_arguments(parser):
-    parser.add_argument("file", help="Path to the .3dsx file to upload")
+    parser.add_argument("--source", required=True, help="Local file or directory to upload")
+    parser.add_argument("--dest", required=True, help="Remote destination file or directory path")
     parser.add_argument(
         "--host",
         help="3DS FTP hostname or IPv4 address. If omitted, the utility tries mDNS discovery or prompts interactively.",
@@ -435,7 +619,6 @@ def add_ftp_arguments(parser):
     )
     parser.add_argument("--user", default="anonymous", help="FTP username. Default: anonymous")
     parser.add_argument("--password", default="", help="FTP password. Default: empty")
-    parser.add_argument("--remote", help="Remote destination file path. Default: /<local basename>")
 
 
 def add_netloader_status_arguments(parser):
@@ -550,7 +733,7 @@ def parse_args(argv):
             FTP_COMMAND,
             UPLOAD_ACTION,
             add_ftp_arguments,
-            "Upload a file through FTP.",
+            "Upload a file or directory through FTP.",
         )
 
     if argv and argv[0] in (NETLOADER_COMMAND, FTP_COMMAND):
@@ -603,12 +786,11 @@ def run_ftp(args):
     send_ftp(
         host=host,
         port=port,
-        path=args.file,
+        source=args.source,
+        dest=args.dest,
         user=args.user,
         password=args.password,
-        remote_path=args.remote,
     )
-    print("FTP upload complete.")
 
 
 def run_status(args):

@@ -8,8 +8,8 @@ This repository is intentionally small. The main utility lives in `3dslink.py` a
 
 - `python3 3dslink.py --help`: show CLI arguments and verify the script starts.
 - `python3 3dslink.py netloader load --host 172.20.10.12 sample-app.3dsx`: send a `.3dsx` file to a known 3DS NetLoader address.
-- `python3 3dslink.py netloader status --host 172.20.10.12`: check whether NetLoader is reachable.
-- `python3 3dslink.py ftp upload --host 172.20.10.12 sample-app.3dsx`: upload a `.3dsx` file to a 3DS FTP server such as ftpd.
+- `python3 3dslink.py netloader status --host 172.20.10.12`: check whether NetLoader is reachable. Tell users to restart NetLoader afterward by pressing `B`, then `Y` in the Homebrew Launcher.
+- `python3 3dslink.py ftp upload --host 172.20.10.12 --source sample-app.3dsx --dest /3ds/`: upload a file or directory to a 3DS FTP server such as ftpd.
 - `python3 3dslink.py ftp status --host 172.20.10.12`: check whether ftpd is reachable and accepts login.
 - `python3 -m unittest discover -s tests -v`: run the full local test suite.
 
