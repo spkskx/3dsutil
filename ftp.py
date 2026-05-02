@@ -5,7 +5,6 @@ import os
 import posixpath
 import shutil
 import socket
-import struct
 import subprocess
 import sys
 import tempfile
@@ -13,8 +12,7 @@ import zipfile
 
 from core import (
     DEFAULT_FTP_PORT, DEFAULT_TIMEOUT, FTP_ARCHIVE_SKIP, FTP_ARCHIVE_UNARCHIVE, FTP_ARCHIVE_UPLOAD,
-    MDNS_ADDR, MDNS_DISCOVERY_TIMEOUT, MDNS_FTP_QUERIES, MDNS_PORT, MDNS_QCLASS_IN, MDNS_QTYPE_A,
-    MDNS_QTYPE_PTR, MDNS_QTYPE_SRV, FTP_CHUNK, DiscoveryError, FTPTransferError, NetloaderError,
+    FTP_CHUNK, DiscoveryError, FTPTransferError, NetloaderError,
     SEVEN_ZIP_COMMANDS, parse_host_port, resolve_host, validate_input_file,
 )
 
@@ -82,53 +80,10 @@ def prompt_install_command_dependency(label, commands, packages):
     return any(command_exists(command) for command in commands)
 
 
-def discover_ftp_mdns(timeout=MDNS_DISCOVERY_TIMEOUT):
-    srv_records = []
-    addresses = {}
-
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            sock.settimeout(timeout)
-
-            for service_name in MDNS_FTP_QUERIES:
-                sock.sendto(build_mdns_query(service_name), (MDNS_ADDR, MDNS_PORT))
-
-            while True:
-                try:
-                    payload, _ = sock.recvfrom(4096)
-                except socket.timeout:
-                    break
-
-                for record in parse_mdns_response(payload):
-                    if record[0] == "srv":
-                        srv_records.append(record)
-                    elif record[0] == "a":
-                        addresses[record[1].rstrip('.')] = record[2]
-    except OSError as exc:
-        raise DiscoveryError(f"failed to use mDNS FTP discovery: {exc}") from exc
-
-    candidates = []
-    seen = set()
-    for _, _, target, port in srv_records:
-        host = addresses.get(target.rstrip('.'), target.rstrip('.'))
-        key = (host, port)
-        if key not in seen:
-            candidates.append(key)
-            seen.add(key)
-
-    return candidates
-
-
 def resolve_ftp_host(host, port, stdin=sys.stdin):
     if host is not None:
         resolved_host, resolved_port = parse_host_port(host, port, "FTP host")
         return resolve_host(resolved_host, resolved_port), resolved_port
-
-    candidates = discover_ftp_mdns()
-    if len(candidates) == 1:
-        candidate_host, candidate_port = candidates[0]
-        return resolve_host(candidate_host, candidate_port), candidate_port
 
     if stdin.isatty():
         prompt = "Enter 3DS FTP host or host:port: "
@@ -138,7 +93,7 @@ def resolve_ftp_host(host, port, stdin=sys.stdin):
         prompted_host, prompted_port = parse_host_port(value, port, "FTP host")
         return resolve_host(prompted_host, prompted_port), prompted_port
 
-    raise DiscoveryError("could not resolve a 3DS FTP host. Pass --host, or run interactively to enter host or host:port")
+    raise DiscoveryError("FTP host is required. Pass --host, or run interactively to enter host or host:port")
 
 
 def normalize_ftp_sources(sources):

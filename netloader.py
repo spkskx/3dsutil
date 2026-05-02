@@ -100,77 +100,6 @@ def resolve_host(host, port):
     return info[0][4][0]
 
 
-def encode_dns_name(name):
-    parts = name.rstrip('.').split('.')
-    return b''.join(bytes([len(part)]) + part.encode('utf-8') for part in parts) + b'\0'
-
-
-def decode_dns_name(payload, offset):
-    labels = []
-    jumped = False
-    next_offset = offset
-
-    while True:
-        length = payload[offset]
-        if length & 0xC0 == 0xC0:
-            pointer = ((length & 0x3F) << 8) | payload[offset + 1]
-            if not jumped:
-                next_offset = offset + 2
-            offset = pointer
-            jumped = True
-            continue
-        if length == 0:
-            offset += 1
-            if not jumped:
-                next_offset = offset
-            break
-
-        offset += 1
-        labels.append(payload[offset:offset + length].decode('utf-8', errors='replace'))
-        offset += length
-
-    return '.'.join(labels), next_offset
-
-
-def build_mdns_query(service_name):
-    header = struct.pack('!HHHHHH', 0, 0, 1, 0, 0, 0)
-    question = encode_dns_name(service_name) + struct.pack('!HH', MDNS_QTYPE_PTR, MDNS_QCLASS_IN)
-    return header + question
-
-
-def parse_mdns_response(payload):
-    if len(payload) < 12:
-        return []
-
-    _, _, question_count, answer_count, authority_count, additional_count = struct.unpack('!HHHHHH', payload[:12])
-    offset = 12
-    records = []
-
-    try:
-        for _ in range(question_count):
-            _, offset = decode_dns_name(payload, offset)
-            offset += 4
-
-        for _ in range(answer_count + authority_count + additional_count):
-            name, offset = decode_dns_name(payload, offset)
-            record_type, _, _, data_length = struct.unpack('!HHIH', payload[offset:offset + 10])
-            offset += 10
-            data_offset = offset
-            offset += data_length
-
-            if record_type == MDNS_QTYPE_SRV:
-                _, _, port = struct.unpack('!HHH', payload[data_offset:data_offset + 6])
-                target, _ = decode_dns_name(payload, data_offset + 6)
-                records.append(("srv", name, target, port))
-            elif record_type == MDNS_QTYPE_A:
-                if data_length == 4:
-                    records.append(("a", name, socket.inet_ntoa(payload[data_offset:data_offset + 4])))
-    except (IndexError, struct.error):
-        return []
-
-    return records
-
-
 def file_has_3dsx_magic(path):
     with open(path, 'rb') as file_obj:
         return file_obj.read(len(THREEDSX_MAGIC)) == THREEDSX_MAGIC
@@ -261,5 +190,4 @@ def resolve_netloader_host(args, stdin=None):
 
     resolved_host, resolved_port = parse_host_port(host, args.port, "NetLoader host")
     return resolve_host(resolved_host, resolved_port), resolved_port
-
 

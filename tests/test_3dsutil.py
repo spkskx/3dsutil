@@ -705,29 +705,19 @@ class FTPTransferTests(unittest.TestCase):
 
 
 class FTPHostResolutionTests(unittest.TestCase):
-    def test_resolve_ftp_host_uses_single_mdns_candidate(self):
-        with mock.patch.object(three_dsutil, "discover_ftp_mdns", return_value=[("n3ds.local", 5000)]), \
-            mock.patch.object(three_dsutil, "resolve_host", return_value="192.168.0.55") as resolve_mock:
-            host, port = three_dsutil.resolve_ftp_host(None, 5000, stdin=io.StringIO(""))
-
-        self.assertEqual((host, port), ("192.168.0.55", 5000))
-        resolve_mock.assert_called_once_with("n3ds.local", 5000)
-
-    def test_resolve_ftp_host_prompts_when_interactive_and_no_candidate(self):
+    def test_resolve_ftp_host_prompts_when_interactive_without_host(self):
         stdin = mock.MagicMock()
         stdin.isatty.return_value = True
 
-        with mock.patch.object(three_dsutil, "discover_ftp_mdns", return_value=[]), \
-            mock.patch.object(builtins, "input", return_value="192.168.0.60:6000"), \
+        with mock.patch.object(builtins, "input", return_value="192.168.0.60:6000"), \
             mock.patch.object(three_dsutil, "resolve_host", return_value="192.168.0.60"):
             host, port = three_dsutil.resolve_ftp_host(None, 5000, stdin=stdin)
 
         self.assertEqual((host, port), ("192.168.0.60", 6000))
 
-    def test_resolve_ftp_host_errors_when_noninteractive_and_no_candidate(self):
-        with mock.patch.object(three_dsutil, "discover_ftp_mdns", return_value=[]):
-            with self.assertRaises(three_dsutil.DiscoveryError):
-                three_dsutil.resolve_ftp_host(None, 5000, stdin=io.StringIO(""))
+    def test_resolve_ftp_host_errors_when_noninteractive_without_host(self):
+        with self.assertRaises(three_dsutil.DiscoveryError):
+            three_dsutil.resolve_ftp_host(None, 5000, stdin=io.StringIO(""))
 
 
 class StatusTests(unittest.TestCase):

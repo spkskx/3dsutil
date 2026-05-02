@@ -45,11 +45,6 @@ def resolve_ftp_host(host, port, stdin=sys.stdin):
         resolved_host, resolved_port = parse_host_port(host, port, "FTP host")
         return resolve_host(resolved_host, resolved_port), resolved_port
 
-    candidates = discover_ftp_mdns()
-    if len(candidates) == 1:
-        candidate_host, candidate_port = candidates[0]
-        return resolve_host(candidate_host, candidate_port), candidate_port
-
     if stdin.isatty():
         value = input("Enter 3DS FTP host or host:port: ").strip()
         if not value:
@@ -57,7 +52,7 @@ def resolve_ftp_host(host, port, stdin=sys.stdin):
         prompted_host, prompted_port = parse_host_port(value, port, "FTP host")
         return resolve_host(prompted_host, prompted_port), prompted_port
 
-    raise DiscoveryError("could not resolve a 3DS FTP host. Pass --host, or run interactively to enter host or host:port")
+    raise DiscoveryError("FTP host is required. Pass --host, or run interactively to enter host or host:port")
 
 
 def get_ftp_archive_action(args, stdin=None):
@@ -96,7 +91,7 @@ def delete_ftp_path(ftp, path, entry_type):
 def add_ftp_connection_arguments(parser):
     parser.add_argument(
         "--host",
-        help="3DS FTP hostname or IPv4 address. If omitted, the utility tries mDNS discovery or prompts interactively.",
+        help="3DS FTP hostname or IPv4 address. If omitted, the utility prompts interactively.",
     )
     parser.add_argument(
         "--port",

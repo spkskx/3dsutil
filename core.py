@@ -24,15 +24,6 @@ FTP_ARCHIVE_UPLOAD = "upload"
 FTP_ARCHIVE_SKIP = "skip"
 SEVEN_ZIP_COMMANDS = ("7zz", "7z")
 THREEDSX_MAGIC = b"3DSX"
-MDNS_ADDR = "224.0.0.251"
-MDNS_PORT = 5353
-MDNS_FTP_QUERIES = ("_ftp._tcp.local", "_ftpd._tcp.local")
-MDNS_DISCOVERY_TIMEOUT = 2.0
-MDNS_QTYPE_PTR = 12
-MDNS_QTYPE_SRV = 33
-MDNS_QTYPE_A = 1
-MDNS_QCLASS_IN = 1
-
 NETLOADER_ERRORS = {
     -1: "failed to create file on the 3DS",
     -2: "insufficient free space on the 3DS",

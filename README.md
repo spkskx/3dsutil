@@ -83,6 +83,7 @@ If `netloader status` succeeds, restart NetLoader before loading a file: press `
 
 - If discovery fails, pass `--host <3DS_IP>`.
 - If NetLoader rejects a file, confirm it is a `.3dsx` file.
+- FTP commands prompt for a host in interactive terminals. In scripts, pass `--host <3DS_IP>`.
 - If FTP upload paths look wrong, check `3dsutil ftp upload --help`.
 - `.7z` extraction requires a `7z` or `7zz` command in `PATH`.
 
