@@ -1,6 +1,6 @@
-# 3dslink.py
+# 3dsutil
 
-`3dslink.py` is a small, dependency-free Python utility for moving homebrew files from your computer to a modded 3DS over Wi-Fi.
+`3dsutil` is a small, dependency-free Python utility for moving homebrew files from your computer to a modded 3DS over Wi-Fi.
 
 It supports:
 
@@ -14,33 +14,67 @@ It supports:
 - Homebrew Launcher NetLoader for `netloader`
 - ftpd or another 3DS FTP server for `ftp`
 
+## Installation
+
+Install the `3dsutil` command with:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/spkskx/3dslink.py/main/install.sh | sh
+```
+
+The installer checks for Python 3 and git. If either is missing, it asks before running a package-manager install command for `apt-get`, `dnf`, `pacman`, or Homebrew.
+
+By default it installs the source into `~/.local/lib/3dsutil.py` and writes a launcher to `~/.local/bin/3dsutil`. Make sure `~/.local/bin` is in your `PATH`.
+
+After installation:
+
+```bash
+3dsutil --help
+3dsutil install --help
+3dsutil update --help
+3dsutil uninstall --help
+3dsutil netloader --help
+3dsutil ftp --help
+```
+
+Once Python and git are available, the CLI can manage itself:
+
+```bash
+3dsutil install
+3dsutil update
+3dsutil uninstall
+```
+
 ## Usage
 
 Start with the built-in help. It is the source of truth for commands and options:
 
 ```bash
-python3 3dslink.py --help
-python3 3dslink.py netloader --help
-python3 3dslink.py netloader load --help
-python3 3dslink.py netloader status --help
-python3 3dslink.py ftp --help
-python3 3dslink.py ftp explorer --help
-python3 3dslink.py ftp upload --help
-python3 3dslink.py ftp status --help
+3dsutil --help
+3dsutil install --help
+3dsutil update --help
+3dsutil uninstall --help
+3dsutil netloader --help
+3dsutil netloader load --help
+3dsutil netloader status --help
+3dsutil ftp --help
+3dsutil ftp explorer --help
+3dsutil ftp upload --help
+3dsutil ftp status --help
 ```
 
 Common commands:
 
 ```bash
-python3 3dslink.py netloader sample-app.3dsx
-python3 3dslink.py netloader --host 172.20.10.12 sample-app.3dsx
-python3 3dslink.py netloader status --host 172.20.10.12
+3dsutil netloader sample-app.3dsx
+3dsutil netloader --host 172.20.10.12 sample-app.3dsx
+3dsutil netloader status --host 172.20.10.12
 
-python3 3dslink.py ftp --host 172.20.10.12
-python3 3dslink.py ftp upload --host 172.20.10.12 --source sample-app.3dsx --dest /3ds/
-python3 3dslink.py ftp upload --host 172.20.10.12 --source first.nds --source second.gba --dest /roms/
-python3 3dslink.py ftp upload --host 172.20.10.12 --source roms.zip --dest /roms/ --unarchive --patterns "*.nds"
-python3 3dslink.py ftp status --host 172.20.10.12
+3dsutil ftp --host 172.20.10.12
+3dsutil ftp upload --host 172.20.10.12 --source sample-app.3dsx --dest /3ds/
+3dsutil ftp upload --host 172.20.10.12 --source first.nds --source second.gba --dest /roms/
+3dsutil ftp upload --host 172.20.10.12 --source roms.zip --dest /roms/ --unarchive --patterns "*.nds"
+3dsutil ftp status --host 172.20.10.12
 ```
 
 If `netloader status` succeeds, restart NetLoader before loading a file: press `B`, then press `Y` in the Homebrew Launcher.
@@ -49,7 +83,7 @@ If `netloader status` succeeds, restart NetLoader before loading a file: press `
 
 - If discovery fails, pass `--host <3DS_IP>`.
 - If NetLoader rejects a file, confirm it is a `.3dsx` file.
-- If FTP upload paths look wrong, check `python3 3dslink.py ftp upload --help`.
+- If FTP upload paths look wrong, check `3dsutil ftp upload --help`.
 - `.7z` extraction requires a `7z` or `7zz` command in `PATH`.
 
 ## Testing

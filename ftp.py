@@ -18,6 +18,70 @@ from core import (
     SEVEN_ZIP_COMMANDS, parse_host_port, resolve_host, validate_input_file,
 )
 
+
+def ask_yes_no(prompt, default=False, stdin=sys.stdin):
+    if not stdin.isatty():
+        return default
+
+    suffix = "[Y/n]" if default else "[y/N]"
+    answer = input(f"{prompt} {suffix}: ").strip().lower()
+    if not answer:
+        return default
+    return answer in ("y", "yes")
+
+
+def command_exists(command):
+    return shutil.which(command) is not None
+
+
+def package_install_command(packages):
+    if command_exists("apt-get"):
+        manager = "apt-get"
+    elif command_exists("dnf"):
+        manager = "dnf"
+    elif command_exists("pacman"):
+        manager = "pacman"
+    elif command_exists("brew"):
+        manager = "brew"
+    else:
+        return None
+
+    if isinstance(packages, dict):
+        packages = packages.get(manager)
+        if not packages:
+            return None
+
+    package_text = " ".join(packages)
+    if manager == "apt-get":
+        return f"sudo apt-get update && sudo apt-get install -y {package_text}"
+    if manager == "dnf":
+        return f"sudo dnf install -y {package_text}"
+    if manager == "pacman":
+        return f"sudo pacman -S --needed {package_text}"
+    if manager == "brew":
+        return f"brew install {package_text}"
+    return None
+
+
+def prompt_install_command_dependency(label, commands, packages):
+    if any(command_exists(command) for command in commands):
+        return True
+
+    install_command = package_install_command(packages)
+    if install_command is None:
+        raise FTPTransferError(f"{label} is required, but no supported package manager was found")
+
+    if not ask_yes_no(f"{label} is required. Install it now?", default=True):
+        return False
+
+    try:
+        subprocess.run(install_command, shell=True, check=True)
+    except subprocess.CalledProcessError as exc:
+        raise FTPTransferError(f"failed to install {label}: {exc}") from exc
+
+    return any(command_exists(command) for command in commands)
+
+
 def discover_ftp_mdns(timeout=MDNS_DISCOVERY_TIMEOUT):
     srv_records = []
     addresses = {}
@@ -133,6 +197,18 @@ def unarchive_ftp_source(source, destination):
 
     if lower_source.endswith(".7z"):
         command = find_7z_command()
+        if command is None:
+            prompt_install_command_dependency(
+                "7z or 7zz",
+                SEVEN_ZIP_COMMANDS,
+                {
+                    "apt-get": ("p7zip-full",),
+                    "dnf": ("p7zip",),
+                    "pacman": ("p7zip",),
+                    "brew": ("p7zip",),
+                },
+            )
+            command = find_7z_command()
         if command is None:
             raise FTPTransferError("extracting .7z files requires a 7z or 7zz command in PATH")
 
@@ -917,4 +993,3 @@ def run_ftp_explorer(args):
             curses.wrapper(ftp_explorer_loop, ftp, "/")
     except ftplib.all_errors + (OSError,) as exc:
         raise FTPTransferError(f"FTP explorer failed for {host}:{port}: {exc}") from exc
-

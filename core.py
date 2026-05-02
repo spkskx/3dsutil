@@ -3,6 +3,9 @@ import socket
 
 NETLOADER_COMMAND = "netloader"
 FTP_COMMAND = "ftp"
+INSTALL_COMMAND = "install"
+UNINSTALL_COMMAND = "uninstall"
+UPDATE_COMMAND = "update"
 STATUS_ACTION = "status"
 LOAD_ACTION = "load"
 UPLOAD_ACTION = "upload"
@@ -80,4 +83,3 @@ def validate_input_file(path):
         raise NetloaderError(f"path is not a file: {path}")
     if os.path.getsize(path) == 0:
         raise NetloaderError(f"file is empty: {path}")
-
