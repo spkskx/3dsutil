@@ -1,21 +1,33 @@
 # 3dsutil
 
-`3dsutil` is a small, dependency-free Python utility for wirelessly moving homebrew files from your computer to a modded 3DS on the same network.
+`3dsutil` is a dependency-free Python utility for wirelessly bootstrapping and managing a modded Nintendo 3DS from your computer.
 
-It is especially useful when a newly modded 3DS does not yet have base apps such as ftpd, FBI, or Universal-Updater, and you cannot easily copy files with an SD card reader. Use NetLoader to wirelessly launch a setup app first, then use FTP for everyday file management after the console has ftpd installed.
+The FTP workflow can automatically extract `.zip` and `.7z` archives while transferring files. That makes ROM copying simple: point `3dsutil` at an archive or a directory full of archives, optionally filter for files such as `*.nds` or `*.gba`, and it extracts to a temporary folder before uploading the matching files to the 3DS SD card. In an interactive terminal, archive uploads prompt with a default yes; in scripts, pass `--unarchive`.
 
-Main components:
+It is useful both on a newly modded 3DS and as a daily file-management tool. Use NetLoader first when the console does not yet have base apps such as ftpd, FBI, or Universal-Updater, then use the FTP explorer and upload commands for regular transfers after ftpd is installed.
 
-- Interactive TUI: run `3dsutil` to choose NetLoader, FTP, update, or quit from one terminal interface.
-- NetLoader: bootstrap a console by loading one `.3dsx` through Homebrew Launcher's 3dslink NetLoader. On the 3DS, open Homebrew Launcher and press `Y`, then use `3dsutil` to send Universal-Updater, FBI, or another setup app wirelessly.
-- FTP: browse local files and the 3DS SD card side by side through ftpd or another 3DS FTP server. Use it for uploads, downloads, copies, moves, deletes, and archive extraction once FTP is available on the console.
+## Highlights
+
+- Interactive TUI: run `3dsutil` with no arguments to choose NetLoader, FTP, update, or quit from one terminal interface.
+- NetLoader bootstrap: discover a 3DS running Homebrew Launcher NetLoader over UDP, upload one `.3dsx`, and launch setup apps without removing the SD card.
+- FTP file explorer: browse local files and the 3DS SD card side by side through ftpd or another 3DS FTP server.
+- FTP transfers: upload files, directories, or multiple sources in one command, with progress output and a summary.
+- Archive-assisted ROM copying: extract `.zip` and `.7z` archives before upload, including archives found inside directory sources.
+- Pattern filtering: upload only matching extracted or source files, such as `*.nds`, `*.gba`, or `*.cia`.
+- File operations in the explorer: copy across panes, move within a pane, delete selected files or directories, and cancel active transfers.
+- Collision handling: skip remote files that already exist with the same size, and upload with a unique name when a remote file exists with a different size.
+- Status checks: test NetLoader or FTP reachability before starting a transfer.
+- Self-management: install, update, or uninstall the `3dsutil` launcher from the CLI.
 
 ## Requirements
 
 - Python 3
-- a modded 3DS on the same network as the computer
+- A modded 3DS on the same network as the computer
 - Homebrew Launcher NetLoader for `netloader`
 - ftpd or another 3DS FTP server for `ftp`
+- `7z` or `7zz` in `PATH` for `.7z` extraction
+
+`.zip` extraction uses the Python standard library. If `.7z` support is needed and `7z`/`7zz` is missing, `3dsutil` can prompt to install the package with a supported package manager when running interactively.
 
 ## Installation
 
@@ -40,12 +52,11 @@ After installation:
 ```bash
 3dsutil --help
 3dsutil
+3dsutil netloader --help
+3dsutil ftp --help
 3dsutil install --help
 3dsutil update --help
 3dsutil uninstall --help
-3dsutil netloader --help
-3dsutil ftp --help
-3dsutil ftp explorer --help
 ```
 
 Once Python and git are available, the CLI can manage itself:
@@ -58,16 +69,47 @@ Once Python and git are available, the CLI can manage itself:
 3dsutil uninstall
 ```
 
-## Usage
+## Quick Start
 
-Start with the built-in help. It is the source of truth for commands and options:
+Start the interactive TUI:
+
+```bash
+3dsutil
+```
+
+Load a `.3dsx` through Homebrew Launcher NetLoader:
+
+```bash
+3dsutil netloader sample-app.3dsx
+3dsutil netloader --host 172.20.10.12 sample-app.3dsx
+3dsutil netloader status --host 172.20.10.12
+```
+
+Open the FTP explorer:
+
+```bash
+3dsutil ftp --host 172.20.10.12
+3dsutil ftp explorer --host 172.20.10.12 --source . --dest /3ds/
+```
+
+Upload files through FTP:
+
+```bash
+3dsutil ftp upload --host 172.20.10.12 --source sample-app.3dsx --dest /3ds/
+3dsutil ftp upload --host 172.20.10.12 --source first.nds --source second.gba --dest /roms/
+3dsutil ftp upload --host 172.20.10.12 --source roms.zip --dest /roms/ --unarchive --patterns "*.nds"
+3dsutil ftp upload --host 172.20.10.12 --source ./archives --dest /roms/ --unarchive --patterns "*.nds" --patterns "*.gba"
+3dsutil ftp status --host 172.20.10.12
+```
+
+If `netloader status` succeeds, restart NetLoader before loading a file: press `B`, then press `Y` in the Homebrew Launcher.
+
+## Command Guide
+
+The built-in help is the source of truth for options:
 
 ```bash
 3dsutil --help
-3dsutil
-3dsutil install --help
-3dsutil update --help
-3dsutil uninstall --help
 3dsutil netloader --help
 3dsutil netloader load --help
 3dsutil netloader status --help
@@ -77,41 +119,36 @@ Start with the built-in help. It is the source of truth for commands and options
 3dsutil ftp status --help
 ```
 
-Common commands:
-
-```bash
-3dsutil
-
-3dsutil netloader sample-app.3dsx
-3dsutil netloader --host 172.20.10.12 sample-app.3dsx
-3dsutil netloader status --host 172.20.10.12
-
-3dsutil ftp --host 172.20.10.12
-3dsutil ftp explorer --host 172.20.10.12 --source . --dest /3ds/
-3dsutil ftp upload --host 172.20.10.12 --source sample-app.3dsx --dest /3ds/
-3dsutil ftp upload --host 172.20.10.12 --source first.nds --source second.gba --dest /roms/
-3dsutil ftp upload --host 172.20.10.12 --source roms.zip --dest /roms/ --unarchive --patterns "*.nds"
-3dsutil ftp status --host 172.20.10.12
-```
-
-If `netloader status` succeeds, restart NetLoader before loading a file: press `B`, then press `Y` in the Homebrew Launcher.
-
 ### Interactive TUI
 
-Run `3dsutil` with no arguments to open the interactive terminal UI.
+Run `3dsutil` with no arguments to open the terminal UI.
 
-- Choose `NetLoader - load one .3dsx`, then choose whether to scan the network or enter a custom address.
-- For scanning, open Homebrew Launcher on the 3DS and press `Y` before starting the scan. If scanning fails, the TUI returns to the NetLoader home screen.
+- Choose `NetLoader - load one .3dsx`, then scan the network or enter a custom address.
+- For scanning, open Homebrew Launcher on the 3DS and press `Y` before starting the scan.
 - Scanning uses UDP discovery only. The TUI does not open a NetLoader TCP connection until after you choose a `.3dsx` file to load.
-- For a custom address, enter a host such as `172.20.10.12`, or enter `host:port` such as `172.20.10.12:17491`. If you enter only a host, the TUI explicitly prompts for the port next.
+- For a custom address, enter a host such as `172.20.10.12`, or `host:port` such as `172.20.10.12:17491`.
 - After selecting a NetLoader target, browse the current directory and choose one `.3dsx` file to upload and launch.
-- After selecting a file, the TUI shows a processing popup while the load runs. If loading fails, it shows the error in a popup and asks you to start NetLoader again on the 3DS by pressing `Y` in Homebrew Launcher and check the network connection.
-- A successful load shows a popup; press `Enter`, `c`, `q`, or `Esc` to return to the main TUI menu.
 - Choose `FTP - browse and transfer files`, start ftpd on the 3DS, then enter the FTP host. You can enter `host:port`, such as `172.20.10.12:5000`, or enter only the host and provide the port when prompted.
 - Choose `Update 3dsutil` from an installed `3dsutil` command to update the local checkout and launcher.
 - Choose `Quit`, or press `q`/`Esc`, to leave the TUI.
 
-### FTP explorer controls
+### NetLoader
+
+NetLoader is best for the first wireless setup step. On the 3DS, open Homebrew Launcher and press `Y`, then run:
+
+```bash
+3dsutil netloader load Universal-Updater.3dsx
+```
+
+If discovery does not find the console, pass the address shown on the 3DS:
+
+```bash
+3dsutil netloader load --host 172.20.10.12 Universal-Updater.3dsx
+```
+
+For compatibility with older usage, `3dsutil netloader sample-app.3dsx` and `3dsutil sample-app.3dsx` also load a `.3dsx`.
+
+### FTP Explorer
 
 The FTP explorer opens local files on the left and the 3DS FTP server on the right. Use `--source` to choose the local starting directory and `--dest` to choose the initial 3DS directory. The local pane cannot browse above its starting directory, while the 3DS pane can still browse up to the console's FTP root.
 
@@ -119,7 +156,7 @@ The FTP explorer opens local files on the left and the 3DS FTP server on the rig
 - Switch panes with `Left`/`Right` or `h`/`l`.
 - Open a directory with `Enter`; go up with `Backspace`.
 - Mark files or directories with `Space`. Hold Shift while moving with `Up`/`Down` or use `J`/`K` to range-mark as the cursor moves.
-- Starting marks on one pane clears marks from the other pane, so copy/move/delete targets always come from one side.
+- Starting marks on one pane clears marks from the other pane, so copy, move, and delete targets always come from one side.
 - Press `u` to unmark everything.
 - Press `p` to paste. Pasting within the same pane moves; pasting across panes copies.
 - Press `d` to delete. The confirmation dialog lists every file or directory that will be deleted.
@@ -127,13 +164,36 @@ The FTP explorer opens local files on the left and the 3DS FTP server on the rig
 
 When copying from local to 3DS, archives can be extracted before upload. When moving within one pane, the explorer prevents moving a directory into itself or into one of its children.
 
+### FTP Upload And Archives
+
+`ftp upload` accepts one or more `--source` values. A source can be a file or directory. Directories are walked recursively.
+
+Archive handling is designed for ROM sets and other bulk transfers:
+
+- Pass `--unarchive` to extract `.zip` or `.7z` sources into a temporary directory before upload.
+- If a directory source contains supported archives, `--unarchive` extracts all supported archives found inside that directory tree.
+- In an interactive terminal, if archives are found and `--unarchive` is omitted, `3dsutil` asks whether to extract them before upload. The default answer is yes.
+- If that interactive prompt is declined, archive files are skipped and the remaining non-archive files are uploaded.
+- In non-interactive use, archives are uploaded as normal files unless `--unarchive` is provided.
+- Use `--patterns` to upload only files matching shell-style patterns after extraction or during normal recursive upload.
+
+Examples:
+
+```bash
+3dsutil ftp upload --host 172.20.10.12 --source roms.zip --dest /roms/ --unarchive
+3dsutil ftp upload --host 172.20.10.12 --source roms.7z --dest /roms/ --unarchive --patterns "*.nds"
+3dsutil ftp upload --host 172.20.10.12 --source ./incoming --dest /roms/ --unarchive --patterns "*.gba"
+```
+
 ## Troubleshooting
 
 - If discovery fails, pass `--host <3DS_IP>`.
 - If NetLoader rejects a file, confirm it is a `.3dsx` file.
+- If `netloader status` succeeds but a later load fails, restart NetLoader by pressing `B`, then `Y` in Homebrew Launcher.
 - FTP commands prompt for a host in interactive terminals. In scripts, pass `--host <3DS_IP>`.
-- If FTP upload paths look wrong, check `3dsutil ftp upload --help`.
+- If FTP upload paths look wrong, check `3dsutil ftp upload --help` and whether `--dest` points to a file path or a directory path ending in `/`.
 - `.7z` extraction requires a `7z` or `7zz` command in `PATH`.
+- If ftpd is unreachable, confirm the 3DS and computer are on the same network and that ftpd is currently open on the console.
 
 ## Development
 
