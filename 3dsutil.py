@@ -15,6 +15,7 @@ from core import (
     FTP_ARCHIVE_SKIP,
     FTP_ARCHIVE_UNARCHIVE,
     FTP_COMMAND,
+    TUI_COMMAND,
     INSTALL_COMMAND,
     LOAD_ACTION,
     NETLOADER_COMMAND,
@@ -31,6 +32,7 @@ from core import (
 )
 from netloader import *
 from ftp import *
+from tui import *
 
 
 DEFAULT_REPO_URL = "https://github.com/spkskx/3dsutil.git"
@@ -185,11 +187,15 @@ def parse_action_args(argv, command, action, add_arguments, description, prog):
 
 def parse_args(argv):
     argv = list(argv)
+    if not argv:
+        return argparse.Namespace(command=TUI_COMMAND, action=None, legacy=False)
+
     parser = argparse.ArgumentParser(
         prog=CLI_PROG,
         description="3dsutil: wirelessly transfer, browse, and manage files on a modded 3DS on the same network.",
         epilog=(
             "Common commands:\n"
+            "  3dsutil\n"
             "  3dsutil netloader sample-app.3dsx\n"
             "  3dsutil ftp --host 172.20.10.12\n"
             "  3dsutil ftp upload --host 172.20.10.12 --source sample-app.3dsx --dest /3ds/\n"
@@ -476,6 +482,7 @@ def write_launcher(bin_dir, install_root, python_executable):
     path = launcher_path(bin_dir)
     with open(path, "w", encoding="utf-8") as file_obj:
         file_obj.write("#!/bin/sh\n")
+        file_obj.write(f'export 3DSUTIL_LAUNCHER="{LAUNCHER_NAME}"\n')
         file_obj.write(f'exec "{python_executable}" "{os.path.join(install_root, "3dsutil.py")}" "$@"\n')
     os.chmod(path, 0o755)
     return path
@@ -534,8 +541,29 @@ def run_update(args):
     print(f"Launcher: {path}")
 
 
+def launched_from_installed_command(argv0=None):
+    if os.environ.get("3DSUTIL_LAUNCHER") == LAUNCHER_NAME:
+        return True
+    if argv0 is None:
+        argv0 = sys.argv[0]
+    return os.path.basename(argv0) == LAUNCHER_NAME
+
+
+def make_default_update_args():
+    args = argparse.Namespace()
+    args.command = UPDATE_COMMAND
+    args.action = None
+    args.legacy = False
+    args.repo_url = os.environ.get("REPO_URL", DEFAULT_REPO_URL)
+    args.ref = os.environ.get("INSTALL_REF", "")
+    args.install_root = os.environ.get("INSTALL_ROOT", DEFAULT_INSTALL_ROOT)
+    args.bin_dir = os.environ.get("BIN_DIR", DEFAULT_BIN_DIR)
+    args.python = os.environ.get("PYTHON", sys.executable)
+    return args
+
+
 def main(argv=None):
-    args = parse_args(argv or sys.argv[1:])
+    args = parse_args(sys.argv[1:] if argv is None else argv)
 
     try:
         if getattr(args, "legacy", False) and getattr(args, "action", UPLOAD_ACTION) != STATUS_ACTION:
@@ -552,6 +580,10 @@ def main(argv=None):
             run_uninstall(args)
         elif args.command == UPDATE_COMMAND:
             run_update(args)
+        elif args.command == TUI_COMMAND:
+            args.show_update = launched_from_installed_command()
+            args.update_args = make_default_update_args()
+            run_tui(args, update_runner=run_update)
         elif args.command == FTP_COMMAND and args.action == EXPLORER_ACTION:
             run_ftp_explorer(args)
         elif args.command == FTP_COMMAND:

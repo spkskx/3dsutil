@@ -616,10 +616,13 @@ def join_local_explorer_path(current, name, root=None):
 
 
 def list_ftp_directory(ftp, path):
-    entries = [{"name": "..", "type": "dir", "size": None, "modify": None}]
+    normalized_path = normalize_remote_path(path)
+    entries = []
+    if normalized_path != "/":
+        entries.append({"name": "..", "type": "dir", "size": None, "modify": None})
     original = ftp.pwd()
     try:
-        ftp.cwd(path)
+        ftp.cwd(normalized_path)
         try:
             raw_entries = list(ftp.mlsd())
         except ftplib.all_errors:
@@ -632,6 +635,8 @@ def list_ftp_directory(ftp, path):
             if entry_type == "cdir":
                 continue
             if entry_type == "pdir":
+                if normalized_path == "/":
+                    continue
                 name = ".."
                 entry_type = "dir"
             entries.append(
@@ -645,7 +650,9 @@ def list_ftp_directory(ftp, path):
     finally:
         ftp.cwd(original)
 
-    return [entries[0]] + sorted(entries[1:], key=ftp_entry_sort_key)
+    if entries and entries[0]["name"] == "..":
+        return [entries[0]] + sorted(entries[1:], key=ftp_entry_sort_key)
+    return sorted(entries, key=ftp_entry_sort_key)
 
 
 def join_ftp_explorer_path(current, name):
@@ -746,6 +753,29 @@ def move_explorer_selection_toggle(side, current_path, entries, selected, select
     if selected != previous_selected:
         selected_paths = toggle_explorer_entry_selection(side, current_path, entries, selected, selected_paths)
     return selected, selected_paths
+
+
+def explorer_range_mark_selection(side, current_path, entries, anchor, selected):
+    if not entries:
+        return set()
+    start = max(0, min(anchor, selected))
+    end = min(len(entries) - 1, max(anchor, selected))
+    selected_paths = set()
+    for index in range(start, end + 1):
+        entry = entries[index]
+        if entry["name"] == "..":
+            continue
+        selected_paths.add((side, explorer_join_path(side, current_path, entry["name"])))
+    return selected_paths
+
+
+def move_explorer_range_selection(side, current_path, entries, selected, direction, anchor=None):
+    if not entries:
+        return selected, set(), anchor
+    if anchor is None:
+        anchor = selected
+    selected = max(0, min(len(entries) - 1, selected + direction))
+    return selected, explorer_range_mark_selection(side, current_path, entries, anchor, selected), anchor
 
 
 def restored_explorer_selection(entries, name, fallback):
@@ -1459,6 +1489,10 @@ def ftp_explorer_loop(stdscr, ftp, local_start_path=None, remote_start_path="/")
         curses.curs_set(0)
     except curses.error:
         pass
+    try:
+        curses.set_escdelay(25)
+    except curses.error:
+        pass
     init_explorer_colors()
     local_root = validate_local_explorer_dir(local_start_path or ".")
     local_path = local_root
@@ -1471,6 +1505,7 @@ def ftp_explorer_loop(stdscr, ftp, local_start_path=None, remote_start_path="/")
     remote_entries = [{"name": "..", "type": "dir", "size": None, "modify": None}]
     marked_paths = set()
     shift_marking_active = False
+    shift_range_anchor = None
     restore_local_selection_name = None
     restore_remote_selection_name = None
 
@@ -1508,10 +1543,12 @@ def ftp_explorer_loop(stdscr, ftp, local_start_path=None, remote_start_path="/")
                 return
             if key in (curses.KEY_LEFT, curses.KEY_RIGHT, ord("h"), ord("l")):
                 shift_marking_active = False
+                shift_range_anchor = None
                 active_side = "remote" if active_side == "local" else "local"
                 continue
             if key in (curses.KEY_UP, ord("k")):
                 shift_marking_active = False
+                shift_range_anchor = None
                 selected = max(0, selected - 1)
                 if active_side == "local":
                     local_selected = selected
@@ -1520,6 +1557,7 @@ def ftp_explorer_loop(stdscr, ftp, local_start_path=None, remote_start_path="/")
                 continue
             if key in (curses.KEY_DOWN, ord("j")):
                 shift_marking_active = False
+                shift_range_anchor = None
                 selected = min(len(entries) - 1, selected + 1)
                 if active_side == "local":
                     local_selected = selected
@@ -1527,15 +1565,15 @@ def ftp_explorer_loop(stdscr, ftp, local_start_path=None, remote_start_path="/")
                     remote_selected = selected
                 continue
             if key in (getattr(curses, "KEY_SR", -1), ord("K")):
-                marked_paths = keep_explorer_marks_for_side(marked_paths, active_side)
-                selected, marked_paths = move_explorer_selection_toggle(
+                if not shift_marking_active:
+                    shift_range_anchor = selected
+                selected, marked_paths, shift_range_anchor = move_explorer_range_selection(
                     active_side,
                     current_path,
                     entries,
                     selected,
-                    marked_paths,
                     -1,
-                    toggle_start=not shift_marking_active,
+                    anchor=shift_range_anchor,
                 )
                 shift_marking_active = True
                 if active_side == "local":
@@ -1544,15 +1582,15 @@ def ftp_explorer_loop(stdscr, ftp, local_start_path=None, remote_start_path="/")
                     remote_selected = selected
                 continue
             if key in (getattr(curses, "KEY_SF", -1), ord("J")):
-                marked_paths = keep_explorer_marks_for_side(marked_paths, active_side)
-                selected, marked_paths = move_explorer_selection_toggle(
+                if not shift_marking_active:
+                    shift_range_anchor = selected
+                selected, marked_paths, shift_range_anchor = move_explorer_range_selection(
                     active_side,
                     current_path,
                     entries,
                     selected,
-                    marked_paths,
                     1,
-                    toggle_start=not shift_marking_active,
+                    anchor=shift_range_anchor,
                 )
                 shift_marking_active = True
                 if active_side == "local":
@@ -1562,6 +1600,7 @@ def ftp_explorer_loop(stdscr, ftp, local_start_path=None, remote_start_path="/")
                 continue
             if key == ord(" "):
                 shift_marking_active = False
+                shift_range_anchor = None
                 entry = entries[selected]
                 if entry["name"] == "..":
                     message = "Cannot select parent entry."
@@ -1576,11 +1615,13 @@ def ftp_explorer_loop(stdscr, ftp, local_start_path=None, remote_start_path="/")
                 continue
             if key in (ord("u"), ord("U"), ord("c"), ord("C"), 27):
                 shift_marking_active = False
+                shift_range_anchor = None
                 marked_paths = set()
                 message = "Marks cleared."
                 continue
             if key == ord("p"):
                 shift_marking_active = False
+                shift_range_anchor = None
                 operation_items = explorer_operation_items(ftp, active_side, current_path, entries, selected, marked_paths)
                 if not operation_items:
                     message = "Move the cursor to a file or directory, or mark item(s) first."
@@ -1666,6 +1707,7 @@ def ftp_explorer_loop(stdscr, ftp, local_start_path=None, remote_start_path="/")
                         shutil.rmtree(cleanup_dir, ignore_errors=True)
             if key == ord("d"):
                 shift_marking_active = False
+                shift_range_anchor = None
                 items = explorer_operation_items(ftp, active_side, current_path, entries, selected, marked_paths)
                 if not items:
                     message = "Cannot delete go up entry. Move the cursor to a file or directory, or mark item(s) first."
@@ -1687,6 +1729,7 @@ def ftp_explorer_loop(stdscr, ftp, local_start_path=None, remote_start_path="/")
                     continue
             if key in (curses.KEY_BACKSPACE, 8, 127):
                 shift_marking_active = False
+                shift_range_anchor = None
                 if current_path == "/":
                     message = "Already at root."
                     continue
@@ -1704,6 +1747,7 @@ def ftp_explorer_loop(stdscr, ftp, local_start_path=None, remote_start_path="/")
                 break
             if key in (curses.KEY_ENTER, 10, 13):
                 shift_marking_active = False
+                shift_range_anchor = None
                 entry = entries[selected]
                 if entry["type"] == "dir":
                     if active_side == "local":

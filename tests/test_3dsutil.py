@@ -13,6 +13,7 @@ import zlib
 from unittest import mock
 
 import ftp as ftp_module
+import tui as tui_module
 
 three_dsutil = importlib.import_module("3dsutil")
 
@@ -37,6 +38,13 @@ class CompressionTests(unittest.TestCase):
 
 
 class ParseArgsTests(unittest.TestCase):
+    def test_parse_args_no_arguments_opens_tui(self):
+        args = three_dsutil.parse_args([])
+
+        self.assertEqual(args.command, three_dsutil.TUI_COMMAND)
+        self.assertIsNone(args.action)
+        self.assertFalse(args.legacy)
+
     def test_parse_args_legacy_defaults_to_netloader(self):
         args = three_dsutil.parse_args(["sample-app.3dsx"])
 
@@ -249,6 +257,7 @@ class Discover3DSTests(unittest.TestCase):
         send_sock = self.make_context_socket()
         recv_sock.recvfrom.side_effect = [
             (three_dsutil.DISCOVERY_RESPONSE_PREFIX + b"-reply", ("192.168.0.55", 17491)),
+            socket.timeout,
         ]
 
         with mock.patch.object(three_dsutil.socket, "socket", side_effect=[recv_sock, send_sock]):
@@ -256,6 +265,22 @@ class Discover3DSTests(unittest.TestCase):
 
         self.assertEqual(host, "192.168.0.55")
         send_sock.sendto.assert_called_once_with(three_dsutil.DISCOVERY_REQUEST, ("255.255.255.255", 17491))
+
+    def test_discover_3ds_hosts_returns_unique_hosts(self):
+        recv_sock = self.make_context_socket()
+        send_sock = self.make_context_socket()
+        recv_sock.recvfrom.side_effect = [
+            (b"noise", ("192.168.0.2", 17491)),
+            (three_dsutil.DISCOVERY_RESPONSE_PREFIX + b"-reply", ("192.168.0.55", 17491)),
+            (three_dsutil.DISCOVERY_RESPONSE_PREFIX + b"-reply", ("192.168.0.55", 17491)),
+            (three_dsutil.DISCOVERY_RESPONSE_PREFIX + b"-reply", ("192.168.0.56", 17491)),
+            socket.timeout,
+        ]
+
+        with mock.patch.object(three_dsutil.socket, "socket", side_effect=[recv_sock, send_sock]):
+            hosts = three_dsutil.discover_3ds_hosts(17491, retries=1, attempt_interval=0.1)
+
+        self.assertEqual(hosts, ["192.168.0.55", "192.168.0.56"])
 
     def test_discover_3ds_raises_when_no_console_replies(self):
         recv_sock = self.make_context_socket()
@@ -603,10 +628,22 @@ class FTPTransferTests(unittest.TestCase):
 
         entries = three_dsutil.list_ftp_directory(ftp, "/")
 
-        self.assertEqual([entry["name"] for entry in entries], ["..", "3ds", "game.nds"])
-        self.assertEqual(entries[1]["type"], "dir")
-        self.assertEqual(entries[2]["size"], "1024")
+        self.assertEqual([entry["name"] for entry in entries], ["3ds", "game.nds"])
+        self.assertEqual(entries[0]["type"], "dir")
+        self.assertEqual(entries[1]["size"], "1024")
         ftp.cwd.assert_any_call("/")
+
+    def test_list_ftp_directory_includes_parent_below_root(self):
+        ftp = mock.MagicMock()
+        ftp.pwd.return_value = "/"
+        ftp.mlsd.return_value = [
+            ("game.nds", {"type": "file", "size": "1024"}),
+        ]
+
+        entries = three_dsutil.list_ftp_directory(ftp, "/roms")
+
+        self.assertEqual([entry["name"] for entry in entries], ["..", "game.nds"])
+        ftp.cwd.assert_any_call("/roms")
 
     def test_format_size_uses_binary_units(self):
         self.assertEqual(three_dsutil.format_size("1536"), "1.5 KiB")
@@ -729,6 +766,57 @@ class FTPTransferTests(unittest.TestCase):
                 ("remote", "/roms/third.nds"),
             },
         )
+
+    def test_move_explorer_range_selection_resets_to_new_range(self):
+        entries = [
+            {"name": "..", "type": "dir"},
+            {"name": "first.nds", "type": "file"},
+            {"name": "second.nds", "type": "file"},
+            {"name": "third.nds", "type": "file"},
+        ]
+
+        selected, selected_paths, anchor = three_dsutil.move_explorer_range_selection(
+            "remote",
+            "/roms",
+            entries,
+            1,
+            1,
+            anchor=None,
+        )
+
+        self.assertEqual(selected, 2)
+        self.assertEqual(anchor, 1)
+        self.assertEqual(selected_paths, {("remote", "/roms/first.nds"), ("remote", "/roms/second.nds")})
+
+        selected, selected_paths, anchor = three_dsutil.move_explorer_range_selection(
+            "remote",
+            "/roms",
+            entries,
+            selected,
+            1,
+            anchor=anchor,
+        )
+
+        self.assertEqual(selected, 3)
+        self.assertEqual(anchor, 1)
+        self.assertEqual(
+            selected_paths,
+            {
+                ("remote", "/roms/first.nds"),
+                ("remote", "/roms/second.nds"),
+                ("remote", "/roms/third.nds"),
+            },
+        )
+
+    def test_explorer_range_mark_selection_skips_parent_entry(self):
+        entries = [
+            {"name": "..", "type": "dir"},
+            {"name": "first.nds", "type": "file"},
+        ]
+
+        selected_paths = three_dsutil.explorer_range_mark_selection("remote", "/roms", entries, 0, 1)
+
+        self.assertEqual(selected_paths, {("remote", "/roms/first.nds")})
 
     def test_keep_explorer_marks_for_side_removes_other_side_marks(self):
         marked_paths = {
@@ -1094,6 +1182,48 @@ class FTPHostResolutionTests(unittest.TestCase):
             three_dsutil.resolve_ftp_host(None, 5000, stdin=io.StringIO(""))
 
 
+class TUITests(unittest.TestCase):
+    def test_parse_tui_host_port_uses_default_port(self):
+        with mock.patch.object(tui_module, "resolve_host", return_value="192.168.0.60") as resolve_mock:
+            host, port = three_dsutil.parse_tui_host_port("3ds.local", 5000, "FTP")
+
+        self.assertEqual((host, port), ("192.168.0.60", 5000))
+        resolve_mock.assert_called_once_with("3ds.local", 5000)
+
+    def test_parse_tui_host_port_accepts_custom_port(self):
+        with mock.patch.object(tui_module, "resolve_host", return_value="192.168.0.60"):
+            self.assertEqual(three_dsutil.parse_tui_host_port("3ds.local:6000", 5000, "FTP"), ("192.168.0.60", 6000))
+
+    def test_parse_tui_host_port_rejects_empty_host(self):
+        with self.assertRaises(three_dsutil.NetloaderError):
+            three_dsutil.parse_tui_host_port("", 5000, "FTP")
+
+    def test_parse_tui_host_entry_reports_missing_port(self):
+        self.assertEqual(three_dsutil.parse_tui_host_entry("3ds.local", 5000, "FTP"), ("3ds.local", 5000, False))
+        self.assertEqual(three_dsutil.parse_tui_host_entry("3ds.local:6000", 5000, "FTP"), ("3ds.local", 6000, True))
+
+    def test_validate_tui_port_accepts_valid_port(self):
+        self.assertEqual(three_dsutil.validate_tui_port("17491", "NetLoader"), 17491)
+
+    def test_validate_tui_port_rejects_invalid_port(self):
+        with self.assertRaises(three_dsutil.NetloaderError):
+            three_dsutil.validate_tui_port("70000", "NetLoader")
+
+    def test_is_netloader_file_candidate_accepts_3dsx(self):
+        with tempfile.NamedTemporaryFile(suffix=".3dsx") as file_obj:
+            file_obj.write(b"payload")
+            file_obj.flush()
+
+            self.assertTrue(three_dsutil.is_netloader_file_candidate(file_obj.name))
+
+    def test_is_netloader_file_candidate_rejects_non_3dsx(self):
+        with tempfile.NamedTemporaryFile(suffix=".txt") as file_obj:
+            file_obj.write(b"payload")
+            file_obj.flush()
+
+            self.assertFalse(three_dsutil.is_netloader_file_candidate(file_obj.name))
+
+
 class StatusTests(unittest.TestCase):
     def test_check_tcp_status_connects_to_host_and_port(self):
         sock = mock.MagicMock()
@@ -1177,6 +1307,15 @@ class ManagementCommandTests(unittest.TestCase):
             with open(path, encoding="utf-8") as file_obj:
                 launcher = file_obj.read()
             self.assertIn("3dsutil.py", launcher)
+            self.assertIn('3DSUTIL_LAUNCHER="3dsutil"', launcher)
+
+    def test_launched_from_installed_command_accepts_launcher_name(self):
+        self.assertTrue(three_dsutil.launched_from_installed_command("/tmp/bin/3dsutil"))
+        self.assertFalse(three_dsutil.launched_from_installed_command("/tmp/checkout/3dsutil.py"))
+
+    def test_launched_from_installed_command_accepts_launcher_environment(self):
+        with mock.patch.dict(three_dsutil.os.environ, {"3DSUTIL_LAUNCHER": "3dsutil"}):
+            self.assertTrue(three_dsutil.launched_from_installed_command("/tmp/checkout/3dsutil.py"))
 
     def test_run_install_clones_and_writes_launcher(self):
         with tempfile.TemporaryDirectory() as temp_dir, \
@@ -1261,6 +1400,18 @@ class ManagementCommandTests(unittest.TestCase):
 
 
 class MainTests(unittest.TestCase):
+    def test_main_runs_tui_for_no_arguments(self):
+        args = argparse.Namespace(command=three_dsutil.TUI_COMMAND, action=None, legacy=False)
+
+        with mock.patch.object(three_dsutil, "parse_args", return_value=args), \
+            mock.patch.object(three_dsutil, "run_tui") as tui_mock:
+            result = three_dsutil.main([])
+
+        self.assertEqual(result, 0)
+        tui_mock.assert_called_once_with(args, update_runner=three_dsutil.run_update)
+        self.assertFalse(args.show_update)
+        self.assertEqual(args.update_args.command, three_dsutil.UPDATE_COMMAND)
+
     def test_main_discovers_host_then_sends_file(self):
         args = argparse.Namespace(command=three_dsutil.NETLOADER_COMMAND, legacy=False, file="sample-app.3dsx", host=None, port=17491)
 

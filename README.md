@@ -2,13 +2,13 @@
 
 `3dsutil` is a small, dependency-free Python utility for wirelessly moving homebrew files from your computer to a modded 3DS on the same network.
 
-It is especially useful when a newly modded 3DS does not yet have core apps such as ftpd, Universal-Updater, or FBI, and you cannot easily copy files with an SD card reader. Connect the 3DS to your network, wirelessly upload and launch Universal-Updater with NetLoader, then finish the rest of the setup directly on the console.
+It is especially useful when a newly modded 3DS does not yet have base apps such as ftpd, FBI, or Universal-Updater, and you cannot easily copy files with an SD card reader. Use NetLoader to wirelessly launch a setup app first, then use FTP for everyday file management after the console has ftpd installed.
 
-It supports:
+Main components:
 
-- NetLoader uploads for launching one `.3dsx` from the Homebrew Launcher.
-- Side-by-side local and 3DS FTP browsing, uploads, downloads, copies, and moves for a 3DS FTP server such as ftpd.
-- FTP uploads can extract `.zip` and `.7z` archives before transfer, which is useful because ROMs are often distributed inside archives.
+- Interactive TUI: run `3dsutil` to choose NetLoader, FTP, update, or quit from one terminal interface.
+- NetLoader: bootstrap a console by loading one `.3dsx` through Homebrew Launcher's 3dslink NetLoader. On the 3DS, open Homebrew Launcher and press `Y`, then use `3dsutil` to send Universal-Updater, FBI, or another setup app wirelessly.
+- FTP: browse local files and the 3DS SD card side by side through ftpd or another 3DS FTP server. Use it for uploads, downloads, copies, moves, deletes, and archive extraction once FTP is available on the console.
 
 ## Requirements
 
@@ -28,7 +28,7 @@ curl -fsSL https://raw.githubusercontent.com/spkskx/3dsutil/main/install.sh | sh
 Install a specific tagged version with:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/spkskx/3dsutil/main/install.sh | INSTALL_REF=1.2 sh
+curl -fsSL https://raw.githubusercontent.com/spkskx/3dsutil/main/install.sh | INSTALL_REF=1.3 sh
 ```
 
 The installer checks for Python 3 and git. If either is missing, it asks before running a package-manager install command for `apt-get`, `dnf`, `pacman`, or Homebrew.
@@ -39,6 +39,7 @@ After installation:
 
 ```bash
 3dsutil --help
+3dsutil
 3dsutil install --help
 3dsutil update --help
 3dsutil uninstall --help
@@ -51,9 +52,9 @@ Once Python and git are available, the CLI can manage itself:
 
 ```bash
 3dsutil install
-3dsutil install --ref 1.2
+3dsutil install --ref 1.3
 3dsutil update
-3dsutil update --ref 1.2
+3dsutil update --ref 1.3
 3dsutil uninstall
 ```
 
@@ -63,6 +64,7 @@ Start with the built-in help. It is the source of truth for commands and options
 
 ```bash
 3dsutil --help
+3dsutil
 3dsutil install --help
 3dsutil update --help
 3dsutil uninstall --help
@@ -78,6 +80,8 @@ Start with the built-in help. It is the source of truth for commands and options
 Common commands:
 
 ```bash
+3dsutil
+
 3dsutil netloader sample-app.3dsx
 3dsutil netloader --host 172.20.10.12 sample-app.3dsx
 3dsutil netloader status --host 172.20.10.12
@@ -91,6 +95,21 @@ Common commands:
 ```
 
 If `netloader status` succeeds, restart NetLoader before loading a file: press `B`, then press `Y` in the Homebrew Launcher.
+
+### Interactive TUI
+
+Run `3dsutil` with no arguments to open the interactive terminal UI.
+
+- Choose `NetLoader - load one .3dsx`, then choose whether to scan the network or enter a custom address.
+- For scanning, open Homebrew Launcher on the 3DS and press `Y` before starting the scan. If scanning fails, the TUI returns to the NetLoader home screen.
+- Scanning uses UDP discovery only. The TUI does not open a NetLoader TCP connection until after you choose a `.3dsx` file to load.
+- For a custom address, enter a host such as `172.20.10.12`, or enter `host:port` such as `172.20.10.12:17491`. If you enter only a host, the TUI explicitly prompts for the port next.
+- After selecting a NetLoader target, browse the current directory and choose one `.3dsx` file to upload and launch.
+- After selecting a file, the TUI shows a processing popup while the load runs. If loading fails, it shows the error in a popup and asks you to start NetLoader again on the 3DS by pressing `Y` in Homebrew Launcher and check the network connection.
+- A successful load shows a popup; press `Enter`, `c`, `q`, or `Esc` to return to the main TUI menu.
+- Choose `FTP - browse and transfer files`, start ftpd on the 3DS, then enter the FTP host. You can enter `host:port`, such as `172.20.10.12:5000`, or enter only the host and provide the port when prompted.
+- Choose `Update 3dsutil` from an installed `3dsutil` command to update the local checkout and launcher.
+- Choose `Quit`, or press `q`/`Esc`, to leave the TUI.
 
 ### FTP explorer controls
 
@@ -116,13 +135,43 @@ When copying from local to 3DS, archives can be extracted before upload. When mo
 - If FTP upload paths look wrong, check `3dsutil ftp upload --help`.
 - `.7z` extraction requires a `7z` or `7zz` command in `PATH`.
 
-## Testing
+## Development
+
+Development checkouts can run the script directly:
+
+```bash
+python3 3dsutil.py --help
+python3 3dsutil.py
+```
+
+Run the test suite with:
 
 ```bash
 python3 -m unittest discover -s tests -v
 ```
 
 CI runs the same test suite on push and pull request for Python 3.11, 3.12, and 3.13.
+
+## Changelog
+
+### 1.3
+
+- Added the interactive TUI as the default `3dsutil` experience.
+- Added NetLoader scan/custom host flows, a `.3dsx` file picker, processing/success/error popups, and installed-command update access from the TUI.
+- Added multi-device NetLoader discovery while keeping file loading as the first TCP connection.
+
+### 1.2
+
+- Expanded FTP support with the side-by-side explorer, local and remote copy/move/delete workflows, transfer progress, cancellation, and archive handling for `.zip` and `.7z`.
+
+### 1.1
+
+- Added command management flows for installing, updating, and uninstalling the `3dsutil` launcher.
+- Kept direct NetLoader and FTP commands scriptable through explicit subcommands.
+
+### 1.0
+
+- Added the initial NetLoader upload path for sending and launching one `.3dsx` file over the local network.
 
 ## License
 

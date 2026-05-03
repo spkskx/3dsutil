@@ -61,7 +61,9 @@ def build_command_buffer(remote_path):
     return remote_path.encode('utf-8') + b'\0'
 
 
-def discover_3ds(port, retries, attempt_interval):
+def discover_3ds_hosts(port, retries, attempt_interval):
+    hosts = []
+    seen = set()
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as recv_sock:
             recv_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -82,13 +84,23 @@ def discover_3ds(port, retries, attempt_interval):
                             break
 
                         if payload.startswith(DISCOVERY_RESPONSE_PREFIX):
-                            return remote[0]
+                            host = remote[0]
+                            if host not in seen:
+                                seen.add(host)
+                                hosts.append(host)
     except OSError as exc:
         raise DiscoveryError(f"failed to use UDP discovery on port {port}: {exc}") from exc
+
+    if hosts:
+        return hosts
 
     raise DiscoveryError(
         "no 3DS replied to discovery. Make sure NetLoader is open, both devices are on the same network, and the port is allowed"
     )
+
+
+def discover_3ds(port, retries, attempt_interval):
+    return discover_3ds_hosts(port, retries, attempt_interval)[0]
 
 
 def resolve_host(host, port):

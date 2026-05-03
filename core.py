@@ -3,6 +3,7 @@ import socket
 
 NETLOADER_COMMAND = "netloader"
 FTP_COMMAND = "ftp"
+TUI_COMMAND = "tui"
 INSTALL_COMMAND = "install"
 UNINSTALL_COMMAND = "uninstall"
 UPDATE_COMMAND = "update"
