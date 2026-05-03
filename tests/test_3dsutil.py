@@ -3,6 +3,7 @@ import builtins
 import importlib
 import io
 import os
+import shutil
 import socket
 import sys
 import tempfile
@@ -688,6 +689,126 @@ class FTPTransferTests(unittest.TestCase):
         self.assertEqual(selected, 2)
         self.assertEqual(selected_paths, {("remote", "/roms/first.nds"), ("remote", "/roms/second.nds")})
 
+    def test_move_explorer_selection_toggle_unmarks_touched_marked_paths(self):
+        entries = [
+            {"name": "..", "type": "dir"},
+            {"name": "first.nds", "type": "file"},
+            {"name": "second.nds", "type": "file"},
+        ]
+        marked_paths = {("remote", "/roms/first.nds")}
+
+        selected, selected_paths = three_dsutil.move_explorer_selection_toggle("remote", "/roms", entries, 1, marked_paths, 1)
+
+        self.assertEqual(selected, 2)
+        self.assertEqual(selected_paths, {("remote", "/roms/second.nds")})
+
+    def test_move_explorer_selection_toggle_can_skip_start_for_continuous_shift_mark(self):
+        entries = [
+            {"name": "first.nds", "type": "file"},
+            {"name": "second.nds", "type": "file"},
+            {"name": "third.nds", "type": "file"},
+        ]
+        marked_paths = {("remote", "/roms/first.nds"), ("remote", "/roms/second.nds")}
+
+        selected, selected_paths = three_dsutil.move_explorer_selection_toggle(
+            "remote",
+            "/roms",
+            entries,
+            1,
+            marked_paths,
+            1,
+            toggle_start=False,
+        )
+
+        self.assertEqual(selected, 2)
+        self.assertEqual(
+            selected_paths,
+            {
+                ("remote", "/roms/first.nds"),
+                ("remote", "/roms/second.nds"),
+                ("remote", "/roms/third.nds"),
+            },
+        )
+
+    def test_keep_explorer_marks_for_side_removes_other_side_marks(self):
+        marked_paths = {
+            ("local", "/tmp/game.nds"),
+            ("remote", "/3ds/app.3dsx"),
+        }
+
+        selected_paths = three_dsutil.keep_explorer_marks_for_side(marked_paths, "remote")
+
+        self.assertEqual(selected_paths, {("remote", "/3ds/app.3dsx")})
+
+    def test_toggle_explorer_entry_selection_unmarks_marked_path(self):
+        entries = [
+            {"name": "first.nds", "type": "file"},
+        ]
+        marked_paths = {("remote", "/roms/first.nds")}
+
+        selected_paths = three_dsutil.toggle_explorer_entry_selection("remote", "/roms", entries, 0, marked_paths)
+
+        self.assertEqual(selected_paths, set())
+
+    def test_explorer_operation_items_uses_marked_items_across_panes(self):
+        ftp = mock.MagicMock()
+        marked_paths = {("local", "/tmp/game.nds")}
+
+        with mock.patch.object(ftp_module.os.path, "isdir", return_value=False):
+            items = three_dsutil.explorer_operation_items(
+                ftp,
+                "remote",
+                "/3ds",
+                [{"name": "app.3dsx", "type": "file"}],
+                0,
+                marked_paths,
+            )
+
+        self.assertEqual(items, [("local", "/tmp/game.nds", {"name": "game.nds", "type": "file"})])
+
+    def test_hover_explorer_directory_returns_hovered_directory(self):
+        entries = [
+            {"name": "..", "type": "dir"},
+            {"name": "roms", "type": "dir"},
+            {"name": "game.nds", "type": "file"},
+        ]
+
+        self.assertEqual(three_dsutil.hover_explorer_directory("remote", "/3ds", entries, 1), "/3ds/roms")
+        self.assertIsNone(three_dsutil.hover_explorer_directory("remote", "/3ds", entries, 2))
+
+    def test_marked_explorer_summary_counts_visible_files_and_dirs(self):
+        selected_paths = {
+            ("local", "/tmp/source/game.nds"),
+            ("local", "/tmp/source/roms"),
+            ("remote", "/3ds/apps"),
+            ("remote", "/old/outside.nds"),
+        }
+
+        summary = three_dsutil.marked_explorer_summary(
+            selected_paths,
+            "/tmp/source",
+            [
+                {"name": "game.nds", "type": "file"},
+                {"name": "roms", "type": "dir"},
+            ],
+            "/3ds",
+            [
+                {"name": "apps", "type": "dir"},
+            ],
+        )
+
+        self.assertEqual(summary, "4 item(s), 1 file(s), 2 dir(s), 1 outside view")
+
+    def test_format_delete_target_labels_side_and_type(self):
+        self.assertEqual(
+            three_dsutil.format_delete_target("local", "/tmp/source/game.nds", {"name": "game.nds", "type": "file"}),
+            "local file: /tmp/source/game.nds",
+        )
+        self.assertEqual(
+            three_dsutil.format_delete_target("remote", "/3ds/apps", {"name": "apps", "type": "dir"}),
+            "3DS dir: /3ds/apps",
+        )
+
     def test_restored_ftp_selection_selects_returned_directory(self):
         entries = [
             {"name": "..", "type": "dir"},
@@ -697,6 +818,69 @@ class FTPTransferTests(unittest.TestCase):
 
         self.assertEqual(three_dsutil.restored_ftp_selection(entries, "nds", 0), 2)
         self.assertEqual(three_dsutil.restored_ftp_selection(entries, "missing", 1), 1)
+
+    def test_explorer_items_for_local_directory_contents_returns_children(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            nested = os.path.join(temp_dir, "nested")
+            os.mkdir(nested)
+            game = os.path.join(temp_dir, "game.nds")
+            with open(game, "w") as file_obj:
+                file_obj.write("game")
+
+            items = three_dsutil.explorer_items_for_local_directory_contents(temp_dir)
+
+        self.assertEqual(
+            [(side, os.path.basename(path), entry["type"]) for side, path, entry in items],
+            [("local", "nested", "dir"), ("local", "game.nds", "file")],
+        )
+
+    def test_prepare_explorer_transfer_items_unarchives_archive_contents(self):
+        stdscr = mock.MagicMock()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            archive_path = os.path.join(temp_dir, "payload.zip")
+            keep_path = os.path.join(temp_dir, "keep.nds")
+            with zipfile.ZipFile(archive_path, "w") as archive:
+                archive.writestr("inside.nds", "rom")
+            with open(keep_path, "w") as file_obj:
+                file_obj.write("keep")
+
+            move_buffer = [
+                ("local", archive_path, {"name": "payload.zip", "type": "file"}),
+                ("local", keep_path, {"name": "keep.nds", "type": "file"}),
+            ]
+
+            with mock.patch.object(ftp_module, "prompt_archive_transfer_action", return_value=three_dsutil.FTP_ARCHIVE_UNARCHIVE):
+                prepared, skip_archives, cleanup_dir = three_dsutil.prepare_explorer_transfer_items(stdscr, move_buffer, "remote")
+
+            try:
+                self.assertFalse(skip_archives)
+                names = sorted(os.path.basename(path) for _, path, _ in prepared)
+                self.assertEqual(names, ["inside.nds", "keep.nds"])
+                self.assertNotIn("payload.zip", names)
+            finally:
+                if cleanup_dir:
+                    shutil.rmtree(cleanup_dir, ignore_errors=True)
+
+    def test_prepare_explorer_transfer_items_unarchives_directory_without_wrapping_temp_dir(self):
+        stdscr = mock.MagicMock()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source_dir = os.path.join(temp_dir, "source")
+            os.mkdir(source_dir)
+            archive_path = os.path.join(source_dir, "payload.zip")
+            with zipfile.ZipFile(archive_path, "w") as archive:
+                archive.writestr("inside.nds", "rom")
+
+            move_buffer = [("local", source_dir, {"name": "source", "type": "dir"})]
+
+            with mock.patch.object(ftp_module, "prompt_archive_transfer_action", return_value=three_dsutil.FTP_ARCHIVE_UNARCHIVE):
+                prepared, skip_archives, cleanup_dir = three_dsutil.prepare_explorer_transfer_items(stdscr, move_buffer, "remote")
+
+            try:
+                self.assertFalse(skip_archives)
+                self.assertEqual([(os.path.basename(path), entry["type"]) for _, path, entry in prepared], [("inside.nds", "file")])
+            finally:
+                if cleanup_dir:
+                    shutil.rmtree(cleanup_dir, ignore_errors=True)
 
     def test_move_ftp_paths_renames_items_into_destination_directory(self):
         ftp = mock.MagicMock()
@@ -728,6 +912,28 @@ class FTPTransferTests(unittest.TestCase):
                 [("/roms", {"name": "roms", "type": "dir"})],
                 "/roms/nested",
             )
+
+    def test_move_ftp_paths_rejects_moving_directory_to_same_path(self):
+        ftp = mock.MagicMock()
+
+        with self.assertRaises(three_dsutil.FTPTransferError):
+            three_dsutil.move_ftp_paths(
+                ftp,
+                [("/roms", {"name": "roms", "type": "dir"})],
+                "/",
+            )
+
+    def test_move_local_paths_rejects_moving_directory_into_itself(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source_dir = os.path.join(temp_dir, "source")
+            child_dir = os.path.join(source_dir, "child")
+            os.makedirs(child_dir)
+
+            with self.assertRaises(three_dsutil.FTPTransferError):
+                three_dsutil.move_local_paths(
+                    [(source_dir, {"name": "source", "type": "dir"})],
+                    child_dir,
+                )
 
     def test_copy_or_move_explorer_items_dispatches_local_to_remote_copy(self):
         ftp = mock.MagicMock()

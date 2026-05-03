@@ -28,7 +28,7 @@ curl -fsSL https://raw.githubusercontent.com/spkskx/3dsutil/main/install.sh | sh
 Install a specific tagged version with:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/spkskx/3dsutil/main/install.sh | INSTALL_REF=1.1 sh
+curl -fsSL https://raw.githubusercontent.com/spkskx/3dsutil/main/install.sh | INSTALL_REF=1.2 sh
 ```
 
 The installer checks for Python 3 and git. If either is missing, it asks before running a package-manager install command for `apt-get`, `dnf`, `pacman`, or Homebrew.
@@ -51,9 +51,9 @@ Once Python and git are available, the CLI can manage itself:
 
 ```bash
 3dsutil install
-3dsutil install --ref 1.1
+3dsutil install --ref 1.2
 3dsutil update
-3dsutil update --ref 1.1
+3dsutil update --ref 1.2
 3dsutil uninstall
 ```
 
@@ -91,6 +91,22 @@ Common commands:
 ```
 
 If `netloader status` succeeds, restart NetLoader before loading a file: press `B`, then press `Y` in the Homebrew Launcher.
+
+### FTP explorer controls
+
+The FTP explorer opens local files on the left and the 3DS FTP server on the right. Use `--source` to choose the local starting directory and `--dest` to choose the initial 3DS directory. The local pane cannot browse above its starting directory, while the 3DS pane can still browse up to the console's FTP root.
+
+- Move the cursor with `Up`/`Down` or `j`/`k`.
+- Switch panes with `Left`/`Right` or `h`/`l`.
+- Open a directory with `Enter`; go up with `Backspace`.
+- Mark files or directories with `Space`. Hold Shift while moving with `Up`/`Down` or use `J`/`K` to range-mark as the cursor moves.
+- Starting marks on one pane clears marks from the other pane, so copy/move/delete targets always come from one side.
+- Press `u` to unmark everything.
+- Press `p` to paste. Pasting within the same pane moves; pasting across panes copies.
+- Press `d` to delete. The confirmation dialog lists every file or directory that will be deleted.
+- During a transfer, press `c`, `q`, or `Esc` to cancel.
+
+When copying from local to 3DS, archives can be extracted before upload. When moving within one pane, the explorer prevents moving a directory into itself or into one of its children.
 
 ## Troubleshooting
 

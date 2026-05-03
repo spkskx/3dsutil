@@ -18,6 +18,18 @@ from core import (
 )
 
 
+class TransferCancelled(Exception):
+    pass
+
+
+COLOR_HEADER = 1
+COLOR_ACTIVE = 2
+COLOR_DIM = 3
+COLOR_MARK = 4
+COLOR_BORDER = 5
+COLOR_ERROR = 6
+
+
 def ask_yes_no(prompt, default=False, stdin=sys.stdin):
     if not stdin.isatty():
         return default
@@ -703,11 +715,41 @@ def add_explorer_entry_to_selection(side, current_path, entries, selected, selec
     return selected_paths
 
 
+def toggle_explorer_entry_selection(side, current_path, entries, selected, selected_paths):
+    entry = entries[selected]
+    if entry["name"] == "..":
+        return selected_paths
+    selection_key = (side, explorer_join_path(side, current_path, entry["name"]))
+    if selection_key in selected_paths:
+        selected_paths.remove(selection_key)
+    else:
+        selected_paths.add(selection_key)
+    return selected_paths
+
+
+def keep_explorer_marks_for_side(selected_paths, side):
+    return {selection for selection in selected_paths if selection[0] == side}
+
+
 def move_explorer_selection(side, current_path, entries, selected, selected_paths, direction):
     selected_paths = add_explorer_entry_to_selection(side, current_path, entries, selected, selected_paths)
     selected = max(0, min(len(entries) - 1, selected + direction))
     selected_paths = add_explorer_entry_to_selection(side, current_path, entries, selected, selected_paths)
     return selected, selected_paths
+
+
+def move_explorer_selection_toggle(side, current_path, entries, selected, selected_paths, direction, toggle_start=True):
+    previous_selected = selected
+    if toggle_start:
+        selected_paths = toggle_explorer_entry_selection(side, current_path, entries, selected, selected_paths)
+    selected = max(0, min(len(entries) - 1, selected + direction))
+    if selected != previous_selected:
+        selected_paths = toggle_explorer_entry_selection(side, current_path, entries, selected, selected_paths)
+    return selected, selected_paths
+
+
+def restored_explorer_selection(entries, name, fallback):
+    return restored_ftp_selection(entries, name, fallback)
 
 
 def restored_ftp_selection(entries, name, fallback):
@@ -737,10 +779,12 @@ def move_ftp_paths(ftp, items, destination_dir):
     destination_dir = normalize_remote_path(destination_dir)
     for source_path, entry in items:
         destination_path = join_remote_path(destination_dir, posixpath.basename(source_path))
+        if entry["type"] == "dir" and (
+            destination_path == source_path or destination_path.startswith(source_path.rstrip("/") + "/")
+        ):
+            raise FTPTransferError(f"cannot move a directory into itself: {source_path}")
         if destination_path == source_path:
             continue
-        if entry["type"] == "dir" and destination_path.startswith(source_path.rstrip("/") + "/"):
-            raise FTPTransferError(f"cannot move a directory into itself: {source_path}")
         ftp.rename(source_path, destination_path)
         moved.append((source_path, destination_path))
     return moved
@@ -896,10 +940,14 @@ def move_local_paths(items, destination_dir):
     moved = []
     for source_path, entry in items:
         destination = os.path.join(destination_dir, os.path.basename(source_path.rstrip(os.sep)))
-        if os.path.abspath(destination) == os.path.abspath(source_path):
-            continue
-        if entry["type"] == "dir" and os.path.abspath(destination).startswith(os.path.abspath(source_path) + os.sep):
+        source_abs = os.path.abspath(source_path)
+        destination_abs = os.path.abspath(destination)
+        if entry["type"] == "dir" and (
+            destination_abs == source_abs or destination_abs.startswith(source_abs + os.sep)
+        ):
             raise FTPTransferError(f"cannot move a directory into itself: {source_path}")
+        if destination_abs == source_abs:
+            continue
         shutil.move(source_path, destination)
         moved.append((source_path, destination))
     return moved
@@ -933,19 +981,125 @@ def truncate_text(text, width):
     return text[: width - 3] + "..." if width > 3 else text[:width]
 
 
+def init_explorer_colors():
+    if not curses.has_colors():
+        return
+    try:
+        curses.start_color()
+        curses.use_default_colors()
+        curses.init_pair(COLOR_HEADER, curses.COLOR_CYAN, -1)
+        curses.init_pair(COLOR_ACTIVE, curses.COLOR_BLACK, curses.COLOR_CYAN)
+        curses.init_pair(COLOR_DIM, curses.COLOR_BLUE, -1)
+        curses.init_pair(COLOR_MARK, curses.COLOR_YELLOW, -1)
+        curses.init_pair(COLOR_BORDER, curses.COLOR_BLUE, -1)
+        curses.init_pair(COLOR_ERROR, curses.COLOR_RED, -1)
+    except curses.error:
+        pass
+
+
+def ui_attr(color_pair=0, extra=0):
+    attr = extra
+    if color_pair:
+        try:
+            attr |= curses.color_pair(color_pair)
+        except curses.error:
+            pass
+    return attr
+
+
+def draw_box(stdscr, y, x, width, height, title="", active=False):
+    if width < 2 or height < 2:
+        return
+    attr = ui_attr(COLOR_ACTIVE if active else COLOR_BORDER, curses.A_BOLD if active else curses.A_NORMAL)
+    horizontal = "-" * max(0, width - 2)
+    stdscr.addnstr(y, x, "+" + horizontal + "+", width, attr)
+    for row in range(y + 1, y + height - 1):
+        stdscr.addnstr(row, x, "|", 1, attr)
+        stdscr.addnstr(row, x + width - 1, "|", 1, attr)
+    stdscr.addnstr(y + height - 1, x, "+" + horizontal + "+", width, attr)
+    if title:
+        label = f" {title} "
+        stdscr.addnstr(y, x + 2, truncate_text(label, max(1, width - 4)), max(1, width - 4), attr)
+
+
+def fill_row(stdscr, y, x, width, attr=0):
+    if width > 0:
+        stdscr.addnstr(y, x, " " * width, width, attr)
+
+
+def draw_shortcuts(stdscr, y, x, width, shortcuts):
+    fill_row(stdscr, y, x, width, ui_attr(COLOR_DIM))
+    cursor_x = x
+    for keys, action in shortcuts:
+        segment_width = len(keys) + len(action) + 3
+        if cursor_x > x and cursor_x + segment_width >= x + width:
+            break
+        if cursor_x > x:
+            stdscr.addnstr(y, cursor_x, "  ", max(0, min(2, x + width - cursor_x)), ui_attr(COLOR_DIM))
+            cursor_x += 2
+        if cursor_x >= x + width:
+            break
+        stdscr.addnstr(y, cursor_x, truncate_text(keys, x + width - cursor_x), x + width - cursor_x, ui_attr(COLOR_MARK, curses.A_BOLD))
+        cursor_x += len(keys)
+        if cursor_x >= x + width:
+            break
+        stdscr.addnstr(y, cursor_x, " ", 1, ui_attr(COLOR_DIM))
+        cursor_x += 1
+        if cursor_x >= x + width:
+            break
+        stdscr.addnstr(y, cursor_x, truncate_text(action, x + width - cursor_x), x + width - cursor_x, ui_attr(COLOR_DIM))
+        cursor_x += len(action)
+
+
 def draw_explorer_pane(stdscr, y, x, width, height, title, side, current_path, entries, selected, active, selected_paths):
-    attr = curses.A_BOLD | (curses.A_REVERSE if active else curses.A_NORMAL)
-    stdscr.addnstr(y, x, truncate_text(title, width - 1), width - 1, attr)
-    stdscr.addnstr(y + 1, x, truncate_text(current_path, width - 1), width - 1, curses.A_DIM)
-    visible_rows = max(1, height - 2)
+    draw_box(stdscr, y, x, width, height, title, active=active)
+    inner_x = x + 1
+    inner_width = max(1, width - 2)
+    stdscr.addnstr(y + 1, inner_x, truncate_text(current_path, inner_width), inner_width, ui_attr(COLOR_DIM, curses.A_DIM))
+    visible_rows = max(1, height - 3)
     offset = max(0, selected - visible_rows + 1)
     for row, entry in enumerate(entries[offset: offset + visible_rows], start=y + 2):
         path = explorer_join_path(side, current_path, entry["name"])
-        selected_marker = "*" if (side, path) in selected_paths else " "
+        is_marked = (side, path) in selected_paths
+        mark = "*" if is_marked else " "
         prefix = "[Dir]" if entry["type"] == "dir" else "     "
-        label = f"{selected_marker} {prefix} {ftp_entry_display_name(entry)}"
-        row_attr = curses.A_REVERSE if active and offset + row - y - 2 == selected else curses.A_NORMAL
-        stdscr.addnstr(row, x, truncate_text(label, width - 1), width - 1, row_attr)
+        label = f"{mark} {prefix} {ftp_entry_display_name(entry)}"
+        is_cursor = active and offset + row - y - 2 == selected
+        row_attr = ui_attr(COLOR_ACTIVE, curses.A_BOLD) if is_cursor else ui_attr(COLOR_MARK if is_marked else 0)
+        fill_row(stdscr, row, inner_x, inner_width, row_attr)
+        stdscr.addnstr(row, inner_x, truncate_text(label, inner_width), inner_width, row_attr)
+
+
+def marked_explorer_summary(selected_paths, local_path, local_entries, remote_path, remote_entries):
+    visible_types = {}
+    for side, current_path, entries in (
+        ("local", local_path, local_entries),
+        ("remote", remote_path, remote_entries),
+    ):
+        for entry in entries:
+            if entry["name"] == "..":
+                continue
+            visible_types[(side, explorer_join_path(side, current_path, entry["name"]))] = entry["type"]
+
+    file_count = 0
+    dir_count = 0
+    unknown_count = 0
+    for key in selected_paths:
+        entry_type = visible_types.get(key)
+        if entry_type == "file":
+            file_count += 1
+        elif entry_type == "dir":
+            dir_count += 1
+        else:
+            unknown_count += 1
+
+    parts = [f"{len(selected_paths)} item(s)"]
+    if file_count or dir_count:
+        parts.append(f"{file_count} file(s)")
+        parts.append(f"{dir_count} dir(s)")
+    if unknown_count:
+        parts.append(f"{unknown_count} outside view")
+    return ", ".join(parts)
 
 
 def draw_ftp_explorer(
@@ -959,7 +1113,6 @@ def draw_ftp_explorer(
     active_side,
     message="",
     selected_paths=None,
-    move_buffer=None,
 ):
     selected_paths = selected_paths or set()
     height, width = stdscr.getmaxyx()
@@ -970,23 +1123,59 @@ def draw_ftp_explorer(
         return
 
     stdscr.erase()
-    stdscr.addnstr(0, 0, "FTP Explorer: Local <-> 3DS", width - 1, curses.A_BOLD)
-    stdscr.addnstr(1, 0, "Tab/Left/Right/h/l switch  Up/Down/j/k move  Space select  Enter open  Backspace up  m stage  p paste  P paste into dir  d delete  c cancel  q quit", width - 1)
+    fill_row(stdscr, 0, 0, width - 1, ui_attr(COLOR_HEADER, curses.A_BOLD))
+    stdscr.addnstr(0, 0, " FTP Explorer: Local <-> 3DS", width - 1, ui_attr(COLOR_HEADER, curses.A_BOLD))
+    draw_shortcuts(
+        stdscr,
+        1,
+        0,
+        width - 1,
+        [
+            ("Left/Right h/l", "switch pane"),
+            ("Up/Down j/k", "move cursor"),
+            ("Shift+Up/Down J/K", "range mark"),
+            ("Space", "toggle mark"),
+        ],
+    )
+    draw_shortcuts(
+        stdscr,
+        2,
+        0,
+        width - 1,
+        [
+            ("Enter", "open"),
+            ("Backspace", "go up"),
+            ("p", "paste"),
+            ("d", "delete"),
+            ("u", "unmark all"),
+            ("q", "quit"),
+        ],
+    )
 
     pane_gap = 2
     pane_width = max(10, (width - pane_gap) // 2)
-    pane_height = max(1, height - 5)
-    draw_explorer_pane(stdscr, 3, 0, pane_width, pane_height, "Local", "local", local_path, local_entries, local_selected, active_side == "local", selected_paths)
-    draw_explorer_pane(stdscr, 3, pane_width + pane_gap, max(10, width - pane_width - pane_gap - 1), pane_height, "3DS", "remote", remote_path, remote_entries, remote_selected, active_side == "remote", selected_paths)
+    pane_height = max(3, height - 6)
+    draw_explorer_pane(stdscr, 4, 0, pane_width, pane_height, "Local", "local", local_path, local_entries, local_selected, active_side == "local", selected_paths)
+    draw_explorer_pane(stdscr, 4, pane_width + pane_gap, max(10, width - pane_width - pane_gap - 1), pane_height, "3DS", "remote", remote_path, remote_entries, remote_selected, active_side == "remote", selected_paths)
 
-    source_text = ""
-    if move_buffer:
-        source_text = f" from {move_buffer[0][0]}"
-    move_text = f"Move: {len(move_buffer)} item(s){source_text} ready. p pastes here, P pastes into selected dir, c/Esc cancels." if move_buffer else "Move: none. Press m to stage selected item(s)."
+    current_path, entries, selected = active_explorer_state(
+        active_side, local_path, local_entries, local_selected, remote_path, remote_entries, remote_selected
+    )
+    cursor_entry = entries[selected] if entries else None
+    cursor_name = ftp_entry_display_name(cursor_entry) if cursor_entry else "n/a"
+    cursor_type = cursor_entry["type"] if cursor_entry else "n/a"
+    marked_text = marked_explorer_summary(selected_paths, local_path, local_entries, remote_path, remote_entries)
+    footer_text = (
+        f"Cursor: {active_side} {cursor_type} {cursor_name} | "
+        f"Marked: {marked_text} | p moves within a side, copies across sides"
+    )
     if height > 1:
-        stdscr.addnstr(height - 2, 0, truncate_text(move_text, width - 1), width - 1, curses.A_DIM)
+        fill_row(stdscr, height - 2, 0, width - 1, ui_attr(COLOR_DIM, curses.A_DIM))
+        stdscr.addnstr(height - 2, 0, truncate_text(footer_text, width - 1), width - 1, ui_attr(COLOR_DIM, curses.A_DIM))
     if message and height > 0:
-        stdscr.addnstr(height - 1, 0, truncate_text(message, width - 1), width - 1, curses.A_DIM)
+        message_attr = ui_attr(COLOR_ERROR if "failed" in message.lower() or "cannot" in message.lower() else COLOR_DIM, curses.A_DIM)
+        fill_row(stdscr, height - 1, 0, width - 1, message_attr)
+        stdscr.addnstr(height - 1, 0, truncate_text(message, width - 1), width - 1, message_attr)
     stdscr.refresh()
 
 
@@ -1017,6 +1206,62 @@ def prompt_ftp_confirmation(stdscr, prompt):
             return True
         if key in (ord("n"), ord("N"), 27, 10, 13):
             return False
+
+
+def format_delete_target(side, path, entry):
+    prefix = "local" if side == "local" else "3DS"
+    entry_type = "dir" if entry["type"] == "dir" else "file"
+    return f"{prefix} {entry_type}: {path}"
+
+
+def prompt_delete_confirmation(stdscr, items):
+    height, width = stdscr.getmaxyx()
+    if height <= 0 or width <= 0:
+        return False
+    if height < 7 or width < 24:
+        return prompt_ftp_confirmation(stdscr, f"Delete {len(items)} item(s)?")
+
+    targets = [format_delete_target(side, path, entry) for side, path, entry in items]
+    box_width = min(max(48, min(90, max([len(line) for line in targets] + [38]) + 4)), max(1, width - 2))
+    box_height = min(max(8, min(height - 2, len(targets) + 5)), max(1, height - 2))
+    top = max(0, (height - box_height) // 2)
+    left = max(0, (width - box_width) // 2)
+    inner_width = max(1, box_width - 4)
+    list_height = max(1, box_height - 5)
+    offset = 0
+
+    while True:
+        for row in range(box_height):
+            stdscr.addnstr(top + row, left, " " * box_width, box_width, curses.A_REVERSE)
+
+        stdscr.addnstr(top, left, "+" + "-" * (box_width - 2) + "+", box_width, curses.A_REVERSE)
+        title = f"Delete {len(items)} item(s)?"
+        stdscr.addnstr(top + 1, left, f"| {truncate_text(title, inner_width).ljust(inner_width)} |", box_width, curses.A_REVERSE)
+        for index in range(list_height):
+            target_index = offset + index
+            if target_index < len(targets):
+                line = targets[target_index]
+            else:
+                line = ""
+            stdscr.addnstr(top + 2 + index, left, f"| {truncate_text(line, inner_width).ljust(inner_width)} |", box_width, curses.A_REVERSE)
+
+        if len(targets) > list_height:
+            footer = f"Up/Down scroll {offset + 1}-{min(offset + list_height, len(targets))}/{len(targets)}  y delete  n/Esc cancel"
+        else:
+            footer = "y delete  n/Esc cancel"
+        stdscr.addnstr(top + box_height - 2, left, f"| {truncate_text(footer, inner_width).ljust(inner_width)} |", box_width, curses.A_REVERSE)
+        stdscr.addnstr(top + box_height - 1, left, "+" + "-" * (box_width - 2) + "+", box_width, curses.A_REVERSE)
+        stdscr.refresh()
+
+        key = stdscr.getch()
+        if key in (ord("y"), ord("Y")):
+            return True
+        if key in (ord("n"), ord("N"), 27, 10, 13):
+            return False
+        if key in (curses.KEY_UP, ord("k")):
+            offset = max(0, offset - 1)
+        if key in (curses.KEY_DOWN, ord("j")):
+            offset = min(max(0, len(targets) - list_height), offset + 1)
 
 
 def prompt_archive_transfer_action(stdscr):
@@ -1055,6 +1300,45 @@ def prompt_archive_transfer_action(stdscr):
             return None
 
 
+def prompt_paste_destination(stdscr, current_dir, hover_dir=None):
+    if hover_dir is None:
+        return current_dir
+
+    height, width = stdscr.getmaxyx()
+    if height <= 0 or width <= 0:
+        return None
+
+    lines = [
+        "Paste destination",
+        "c: current directory",
+        "h: cursor directory",
+        "Esc: cancel",
+    ]
+    box_width = min(max(38, max(len(line) for line in lines) + 4), max(1, width - 2))
+    box_height = len(lines) + 2
+    top = max(0, (height - box_height) // 2)
+    left = max(0, (width - box_width) // 2)
+
+    for row in range(box_height):
+        stdscr.addnstr(top + row, left, " " * box_width, box_width, curses.A_REVERSE)
+
+    stdscr.addnstr(top, left, "+" + "-" * (box_width - 2) + "+", box_width, curses.A_REVERSE)
+    for index, line in enumerate(lines, start=1):
+        text = truncate_text(line, box_width - 4)
+        stdscr.addnstr(top + index, left, f"| {text.ljust(box_width - 4)} |", box_width, curses.A_REVERSE)
+    stdscr.addnstr(top + box_height - 1, left, "+" + "-" * (box_width - 2) + "+", box_width, curses.A_REVERSE)
+    stdscr.refresh()
+
+    while True:
+        key = stdscr.getch()
+        if key in (ord("c"), ord("C")):
+            return current_dir
+        if key in (ord("h"), ord("H")):
+            return hover_dir
+        if key in (27, ord("q"), ord("Q")):
+            return None
+
+
 def draw_transfer_progress(stdscr, label, sent, total, item_index, item_total):
     height, width = stdscr.getmaxyx()
     if height <= 0 or width <= 0:
@@ -1085,7 +1369,7 @@ def draw_transfer_progress(stdscr, label, sent, total, item_index, item_total):
     stdscr.addnstr(top + 2, left, f"| {truncate_text(label, inner_width).ljust(inner_width)} |", box_width, curses.A_REVERSE)
     stdscr.addnstr(top + 3, left, f"| {bar[:inner_width].ljust(inner_width)} |", box_width, curses.A_REVERSE)
     stdscr.addnstr(top + 4, left, f"| {size_text.ljust(inner_width)} |", box_width, curses.A_REVERSE)
-    stdscr.addnstr(top + 5, left, f"| {'Please wait...'.ljust(inner_width)} |", box_width, curses.A_REVERSE)
+    stdscr.addnstr(top + 5, left, f"| {'c/Esc/q cancels'.ljust(inner_width)} |", box_width, curses.A_REVERSE)
     stdscr.addnstr(top + box_height - 1, left, "+" + "-" * (box_width - 2) + "+", box_width, curses.A_REVERSE)
     stdscr.refresh()
 
@@ -1112,6 +1396,44 @@ def selected_explorer_items(side, current_path, entries, selected, selected_path
     return [(side, explorer_join_path(side, current_path, entry["name"]), entry)]
 
 
+def explorer_items_from_marked_paths(ftp, marked_paths):
+    items = []
+    for side, path in sorted(marked_paths):
+        if side == "local":
+            entry_type = "dir" if os.path.isdir(path) else "file"
+            name = os.path.basename(path.rstrip(os.sep))
+        else:
+            entry_type = "dir" if remote_is_dir(ftp, path) else "file"
+            name = posixpath.basename(path.rstrip("/"))
+        items.append((side, path, {"name": name, "type": entry_type}))
+    return items
+
+
+def explorer_operation_items(ftp, side, current_path, entries, selected, marked_paths):
+    if marked_paths:
+        return explorer_items_from_marked_paths(ftp, marked_paths)
+    return selected_explorer_items(side, current_path, entries, selected, set())
+
+
+def hover_explorer_directory(side, current_path, entries, selected):
+    if not entries:
+        return None
+    entry = entries[selected]
+    if entry["name"] == ".." or entry["type"] != "dir":
+        return None
+    return explorer_join_path(side, current_path, entry["name"])
+
+
+def explorer_items_for_local_directory_contents(directory):
+    items = []
+    for entry in list_local_directory(directory, directory):
+        if entry["name"] == "..":
+            continue
+        path = join_local_explorer_path(directory, entry["name"], directory)
+        items.append(("local", path, entry))
+    return items
+
+
 def prepare_explorer_transfer_items(stdscr, move_buffer, destination_side):
     if not move_buffer or move_buffer[0][0] != "local" or destination_side != "remote":
         return move_buffer, False, None
@@ -1127,10 +1449,8 @@ def prepare_explorer_transfer_items(stdscr, move_buffer, destination_side):
     temp_dir = tempfile.mkdtemp(prefix="3dsutil-explorer-")
     archive_paths = [path for _, path, _ in move_buffer if has_archive_sources(path)]
     unarchive_ftp_sources(archive_paths, temp_dir)
-    prepared = [
-        ("local", temp_dir, {"name": os.path.basename(temp_dir), "type": "dir"})
-    ]
-    prepared.extend(item for item in move_buffer if not is_supported_archive(item[1]))
+    prepared = explorer_items_for_local_directory_contents(temp_dir)
+    prepared.extend(item for item in move_buffer if not has_archive_sources(item[1]))
     return prepared, False, temp_dir
 
 
@@ -1139,6 +1459,7 @@ def ftp_explorer_loop(stdscr, ftp, local_start_path=None, remote_start_path="/")
         curses.curs_set(0)
     except curses.error:
         pass
+    init_explorer_colors()
     local_root = validate_local_explorer_dir(local_start_path or ".")
     local_path = local_root
     remote_path = normalize_remote_path(remote_start_path)
@@ -1148,10 +1469,10 @@ def ftp_explorer_loop(stdscr, ftp, local_start_path=None, remote_start_path="/")
     message = ""
     local_entries = [{"name": "..", "type": "dir", "size": None, "modify": None}]
     remote_entries = [{"name": "..", "type": "dir", "size": None, "modify": None}]
-    selected_paths = set()
-    shift_selected_paths = set()
-    shift_selecting = False
-    move_buffer = []
+    marked_paths = set()
+    shift_marking_active = False
+    restore_local_selection_name = None
+    restore_remote_selection_name = None
 
     while True:
         try:
@@ -1160,8 +1481,10 @@ def ftp_explorer_loop(stdscr, ftp, local_start_path=None, remote_start_path="/")
             message = ""
         except ftplib.all_errors + (OSError,) as exc:
             message = f"Could not list directory: {exc}"
-        local_selected = restored_ftp_selection(local_entries, None, local_selected)
-        remote_selected = restored_ftp_selection(remote_entries, None, remote_selected)
+        local_selected = restored_explorer_selection(local_entries, restore_local_selection_name, local_selected)
+        remote_selected = restored_explorer_selection(remote_entries, restore_remote_selection_name, remote_selected)
+        restore_local_selection_name = None
+        restore_remote_selection_name = None
         while True:
             draw_ftp_explorer(
                 stdscr,
@@ -1173,8 +1496,7 @@ def ftp_explorer_loop(stdscr, ftp, local_start_path=None, remote_start_path="/")
                 remote_selected,
                 active_side,
                 message,
-                selected_paths=selected_paths | shift_selected_paths,
-                move_buffer=move_buffer,
+                selected_paths=marked_paths,
             )
             key = stdscr.getch()
             message = ""
@@ -1184,98 +1506,105 @@ def ftp_explorer_loop(stdscr, ftp, local_start_path=None, remote_start_path="/")
 
             if key in (ord("q"), ord("Q")):
                 return
-            if key in (ord("\t"), curses.KEY_LEFT, curses.KEY_RIGHT, ord("h"), ord("l")):
+            if key in (curses.KEY_LEFT, curses.KEY_RIGHT, ord("h"), ord("l")):
+                shift_marking_active = False
                 active_side = "remote" if active_side == "local" else "local"
-                shift_selected_paths = set()
-                shift_selecting = False
                 continue
             if key in (curses.KEY_UP, ord("k")):
+                shift_marking_active = False
                 selected = max(0, selected - 1)
                 if active_side == "local":
                     local_selected = selected
                 else:
                     remote_selected = selected
-                shift_selected_paths = set()
-                shift_selecting = False
                 continue
             if key in (curses.KEY_DOWN, ord("j")):
+                shift_marking_active = False
                 selected = min(len(entries) - 1, selected + 1)
                 if active_side == "local":
                     local_selected = selected
                 else:
                     remote_selected = selected
-                shift_selected_paths = set()
-                shift_selecting = False
                 continue
             if key in (getattr(curses, "KEY_SR", -1), ord("K")):
-                if not shift_selecting:
-                    selected_paths = set()
-                    shift_selected_paths = set()
-                    shift_selecting = True
-                selected, shift_selected_paths = move_explorer_selection(active_side, current_path, entries, selected, shift_selected_paths, -1)
+                marked_paths = keep_explorer_marks_for_side(marked_paths, active_side)
+                selected, marked_paths = move_explorer_selection_toggle(
+                    active_side,
+                    current_path,
+                    entries,
+                    selected,
+                    marked_paths,
+                    -1,
+                    toggle_start=not shift_marking_active,
+                )
+                shift_marking_active = True
                 if active_side == "local":
                     local_selected = selected
                 else:
                     remote_selected = selected
                 continue
             if key in (getattr(curses, "KEY_SF", -1), ord("J")):
-                if not shift_selecting:
-                    selected_paths = set()
-                    shift_selected_paths = set()
-                    shift_selecting = True
-                selected, shift_selected_paths = move_explorer_selection(active_side, current_path, entries, selected, shift_selected_paths, 1)
+                marked_paths = keep_explorer_marks_for_side(marked_paths, active_side)
+                selected, marked_paths = move_explorer_selection_toggle(
+                    active_side,
+                    current_path,
+                    entries,
+                    selected,
+                    marked_paths,
+                    1,
+                    toggle_start=not shift_marking_active,
+                )
+                shift_marking_active = True
                 if active_side == "local":
                     local_selected = selected
                 else:
                     remote_selected = selected
                 continue
             if key == ord(" "):
+                shift_marking_active = False
                 entry = entries[selected]
                 if entry["name"] == "..":
                     message = "Cannot select parent entry."
                     continue
+                marked_paths = keep_explorer_marks_for_side(marked_paths, active_side)
                 path = explorer_join_path(active_side, current_path, entry["name"])
                 selection_key = (active_side, path)
-                if selection_key in selected_paths:
-                    selected_paths.remove(selection_key)
+                if selection_key in marked_paths:
+                    marked_paths.remove(selection_key)
                 else:
-                    selected_paths.add(selection_key)
-                shift_selected_paths = set()
-                shift_selecting = False
+                    marked_paths.add(selection_key)
                 continue
-            if key in (ord("c"), ord("C"), 27):
-                move_buffer = []
-                message = "Move canceled."
+            if key in (ord("u"), ord("U"), ord("c"), ord("C"), 27):
+                shift_marking_active = False
+                marked_paths = set()
+                message = "Marks cleared."
                 continue
-            if key == ord("m"):
-                items = selected_explorer_items(active_side, current_path, entries, selected, selected_paths | shift_selected_paths)
-                if not items:
-                    message = "Select a file or directory to move."
+            if key == ord("p"):
+                shift_marking_active = False
+                operation_items = explorer_operation_items(ftp, active_side, current_path, entries, selected, marked_paths)
+                if not operation_items:
+                    message = "Move the cursor to a file or directory, or mark item(s) first."
                     continue
-                move_buffer = items
-                selected_paths = set()
-                shift_selected_paths = set()
-                shift_selecting = False
-                message = f"Staged {len(move_buffer)} item(s) to move."
-                continue
-            if key in (ord("p"), ord("P")):
-                if not move_buffer:
-                    message = "No staged move. Press m first."
+                operation_sides = {side for side, _, _ in operation_items}
+                if len(operation_sides) > 1:
+                    message = "Marked items must all be on the same side."
                     continue
                 destination_dir = current_path
-                if key == ord("P"):
-                    entry = entries[selected]
-                    if entry["type"] == "dir" and entry["name"] != "..":
-                        destination_dir = explorer_join_path(active_side, current_path, entry["name"])
-                cross_pane = move_buffer and move_buffer[0][0] != active_side
+                hover_dir = hover_explorer_directory(active_side, current_path, entries, selected)
+                destination_dir = prompt_paste_destination(stdscr, current_path, hover_dir)
+                if destination_dir is None:
+                    message = "Paste canceled."
+                    continue
+                cross_pane = operation_items and operation_items[0][0] != active_side
                 verb = "Copy" if cross_pane else "Move"
-                description = f"{verb} {len(move_buffer)} item(s) to {destination_dir}?"
+                description = f"{verb} {len(operation_items)} item(s) to {destination_dir}?"
                 if not prompt_ftp_confirmation(stdscr, description):
-                    message = "Move canceled."
+                    message = "Paste canceled."
                     continue
                 cleanup_dir = None
+                previous_nodelay = False
                 try:
-                    prepared_buffer, skip_archives, cleanup_dir = prepare_explorer_transfer_items(stdscr, move_buffer, active_side)
+                    prepared_buffer, skip_archives, cleanup_dir = prepare_explorer_transfer_items(stdscr, operation_items, active_side)
                     if prepared_buffer is None:
                         message = "Transfer canceled."
                         continue
@@ -1289,19 +1618,26 @@ def ftp_explorer_loop(stdscr, ftp, local_start_path=None, remote_start_path="/")
                         remote_selected,
                         active_side,
                         message,
-                        selected_paths=selected_paths | shift_selected_paths,
-                        move_buffer=move_buffer,
+                        selected_paths=marked_paths,
                     )
                     progress = None
                     if prepared_buffer and prepared_buffer[0][0] != active_side:
-                        progress = lambda label, sent, total, item_index, item_total: draw_transfer_progress(
-                            stdscr,
-                            label,
-                            sent,
-                            total,
-                            item_index,
-                            item_total,
-                        )
+                        try:
+                            stdscr.nodelay(True)
+                            previous_nodelay = True
+                        except curses.error:
+                            pass
+
+                        last_progress_drawn = [0.0]
+
+                        def progress(label, sent, total, item_index, item_total):
+                            now = time.monotonic()
+                            key = stdscr.getch()
+                            if key in (ord("c"), ord("C"), ord("q"), ord("Q"), 27):
+                                raise TransferCancelled()
+                            if sent == total or now - last_progress_drawn[0] >= 0.2:
+                                draw_transfer_progress(stdscr, label, sent, total, item_index, item_total)
+                                last_progress_drawn[0] = now
                     moved = copy_or_move_explorer_items(
                         ftp,
                         prepared_buffer,
@@ -1312,26 +1648,29 @@ def ftp_explorer_loop(stdscr, ftp, local_start_path=None, remote_start_path="/")
                     )
                     action = "Copied" if prepared_buffer and prepared_buffer[0][0] != active_side else "Moved"
                     message = f"{action} {len(moved)} item(s)."
-                    move_buffer = []
-                    selected_paths = set()
-                    shift_selected_paths = set()
-                    shift_selecting = False
+                    marked_paths = set()
+                    break
+                except TransferCancelled:
+                    message = "Transfer canceled."
                     break
                 except ftplib.all_errors + (OSError, FTPTransferError) as exc:
-                    message = f"Move failed: {exc}"
+                    message = f"Paste failed: {exc}"
                     continue
                 finally:
+                    if previous_nodelay:
+                        try:
+                            stdscr.nodelay(False)
+                        except curses.error:
+                            pass
                     if cleanup_dir is not None:
                         shutil.rmtree(cleanup_dir, ignore_errors=True)
             if key == ord("d"):
-                items = selected_explorer_items(active_side, current_path, entries, selected, selected_paths | shift_selected_paths)
+                shift_marking_active = False
+                items = explorer_operation_items(ftp, active_side, current_path, entries, selected, marked_paths)
                 if not items:
-                    message = "Select a file or directory to delete."
+                    message = "Cannot delete go up entry. Move the cursor to a file or directory, or mark item(s) first."
                     continue
-                names = ", ".join(path for _, path, _ in items[:3])
-                suffix = "..." if len(items) > 3 else ""
-                description = f"Delete {len(items)} item(s): {names}{suffix}?"
-                if not prompt_ftp_confirmation(stdscr, description):
+                if not prompt_delete_confirmation(stdscr, items):
                     message = "Delete canceled."
                     continue
                 try:
@@ -1340,17 +1679,14 @@ def ftp_explorer_loop(stdscr, ftp, local_start_path=None, remote_start_path="/")
                             delete_local_path(path, entry["type"])
                         else:
                             delete_ftp_path(ftp, path, entry["type"])
-                    selected_paths = set()
-                    shift_selected_paths = set()
-                    shift_selecting = False
-                    deleted_keys = {(side, path) for side, path, _ in items}
-                    move_buffer = [(side, path, entry) for side, path, entry in move_buffer if (side, path) not in deleted_keys]
+                    marked_paths = set()
                     message = f"Deleted {len(items)} item(s)."
                     break
                 except ftplib.all_errors + (OSError,) as exc:
                     message = f"Delete failed: {exc}"
                     continue
             if key in (curses.KEY_BACKSPACE, 8, 127):
+                shift_marking_active = False
                 if current_path == "/":
                     message = "Already at root."
                     continue
@@ -1358,29 +1694,34 @@ def ftp_explorer_loop(stdscr, ftp, local_start_path=None, remote_start_path="/")
                     if local_path == local_root:
                         message = "Already at local start directory."
                         continue
+                    previous_path = local_path
                     local_path = join_local_explorer_path(local_path, "..", local_root)
-                    local_selected = 0
+                    restore_local_selection_name = os.path.basename(previous_path.rstrip(os.sep))
                 else:
+                    previous_path = remote_path
                     remote_path = join_ftp_explorer_path(remote_path, "..")
-                    remote_selected = 0
-                selected_paths = set()
-                shift_selected_paths = set()
-                shift_selecting = False
+                    restore_remote_selection_name = posixpath.basename(previous_path.rstrip("/"))
                 break
             if key in (curses.KEY_ENTER, 10, 13):
+                shift_marking_active = False
                 entry = entries[selected]
                 if entry["type"] == "dir":
                     if active_side == "local":
+                        previous_path = local_path
                         local_path = join_local_explorer_path(local_path, entry["name"], local_root)
-                        local_selected = 0
+                        if entry["name"] == "..":
+                            restore_local_selection_name = os.path.basename(previous_path.rstrip(os.sep))
+                        else:
+                            local_selected = 0
                     else:
+                        previous_path = remote_path
                         remote_path = join_ftp_explorer_path(remote_path, entry["name"])
-                        remote_selected = 0
-                    selected_paths = set()
-                    shift_selected_paths = set()
-                    shift_selecting = False
+                        if entry["name"] == "..":
+                            restore_remote_selection_name = posixpath.basename(previous_path.rstrip("/"))
+                        else:
+                            remote_selected = 0
                     break
-                message = "Selected file. Press m to stage it for moving."
+                message = "Cursor is on a file. Press Space to mark it, or p/d to operate on it."
 
 
 def run_ftp_explorer(args):
