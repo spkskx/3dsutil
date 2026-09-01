@@ -1,9 +1,11 @@
 import curses
 import ftplib
 import io
+import json
 import os
 import subprocess
 import sys
+import tempfile
 from contextlib import redirect_stderr, redirect_stdout
 
 from core import (
@@ -12,11 +14,14 @@ from core import (
     DEFAULT_NETLOADER_PORT,
     DEFAULT_TIMEOUT,
     DiscoveryError,
+    FTP_ARCHIVE_SKIP,
+    FTP_ARCHIVE_UNARCHIVE,
     FTPTransferError,
     NetloaderError,
     parse_host_port,
     resolve_host,
 )
+from download import download_url
 from ftp import (
     COLOR_ACTIVE,
     COLOR_DIM,
@@ -25,21 +30,27 @@ from ftp import (
     draw_box,
     draw_explorer_pane,
     draw_shortcuts,
+    draw_transfer_progress,
     fill_row,
     ftp_explorer_loop,
+    has_archive_sources,
     init_explorer_colors,
     join_local_explorer_path,
     list_local_directory,
+    normalize_remote_path,
+    prompt_archive_transfer_action,
     restored_explorer_selection,
+    send_ftp,
     truncate_text,
     ui_attr,
+    unarchive_ftp_sources,
     validate_local_explorer_dir,
 )
 from netloader import discover_3ds_hosts, send_3dsx, validate_netloader_file
 
 
 APP_OVERVIEW = [
-    "Version 1.3",
+    "Version 1.4",
     "Wirelessly launch .3dsx homebrew with NetLoader or browse files through a 3DS FTP server.",
     "Keep your computer and 3DS on the same network. Use arrow keys or j/k, Enter to select, q/Esc to go back.",
 ]
@@ -54,6 +65,35 @@ FTP_OVERVIEW = [
     "Use the explorer to copy, move, delete, upload, download, and optionally unarchive files.",
 ]
 NETLOADER_HELP = "Start NetLoader on the 3DS: Homebrew Launcher, then press Y. Check Wi-Fi/network connection too."
+DEFAULT_TWILIGHT_DEST = "/roms/nds/"
+
+
+def tui_config_path():
+    config_home = os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config"))
+    return os.path.join(config_home, "3dsutil", "config.json")
+
+
+def normalize_tui_download_destination(path):
+    normalized = normalize_remote_path(path.strip())
+    return normalized if normalized == "/" else normalized + "/"
+
+
+def load_tui_download_destination(path=None):
+    try:
+        with open(path or tui_config_path(), encoding="utf-8") as file_obj:
+            destination = json.load(file_obj).get("last_download_destination")
+        if not isinstance(destination, str) or not destination.strip():
+            return DEFAULT_TWILIGHT_DEST
+        return normalize_tui_download_destination(destination)
+    except (OSError, ValueError, AttributeError):
+        return DEFAULT_TWILIGHT_DEST
+
+
+def save_tui_download_destination(destination, path=None):
+    config_path = path or tui_config_path()
+    os.makedirs(os.path.dirname(config_path), exist_ok=True)
+    with open(config_path, "w", encoding="utf-8") as file_obj:
+        json.dump({"last_download_destination": destination}, file_obj)
 
 
 def is_netloader_file_candidate(path):
@@ -473,6 +513,61 @@ def run_ftp_tui(stdscr):
         return
 
 
+def run_ftp_download_tui(stdscr):
+    draw_menu(stdscr, "Download Link", ["Enter FTP host..."], 0, description=FTP_OVERVIEW)
+    target, message = prompt_tui_target(stdscr, "FTP", "FTP", DEFAULT_FTP_PORT)
+    if target is None:
+        if message:
+            show_popup(stdscr, "Download Link", f"FTP failed: {message}")
+        return
+
+    url = prompt_text(stdscr, "Download Link", "Direct HTTP(S) URL")
+    if not url:
+        return
+    destination = prompt_text(
+        stdscr,
+        "Download Destination",
+        "3DS destination directory",
+        load_tui_download_destination(),
+    )
+    if not destination:
+        return
+    destination = normalize_tui_download_destination(destination)
+
+    host, port = target
+    try:
+        with tempfile.TemporaryDirectory(prefix="3dsutil-tui-download-") as temp_dir:
+            show_popup(stdscr, "Download Link", "Downloading. Processing...", wait=False)
+            source = download_url(
+                url,
+                temp_dir,
+                progress=lambda label, sent, total: draw_transfer_progress(stdscr, label, sent, total, 1, 1),
+            )
+            skip_archives = False
+            if has_archive_sources(source):
+                action = prompt_archive_transfer_action(stdscr)
+                if action is None:
+                    return
+                if action == FTP_ARCHIVE_UNARCHIVE:
+                    extract_dir = os.path.join(temp_dir, "extracted")
+                    os.makedirs(extract_dir)
+                    source = unarchive_ftp_sources(source, extract_dir)
+                else:
+                    skip_archives = action == FTP_ARCHIVE_SKIP
+
+            show_popup(stdscr, "Download Link", "Uploading. Processing...", wait=False)
+            send_ftp(host, port, source, destination, "anonymous", "", skip_archives=skip_archives)
+        try:
+            save_tui_download_destination(destination)
+        except OSError:
+            show_popup(stdscr, "Download Link", "Downloaded and uploaded, but could not save destination.")
+            return
+    except FTPTransferError as exc:
+        show_popup(stdscr, "Download Link", f"Transfer failed: {exc}")
+        return
+    show_popup(stdscr, "Download Link", "Downloaded and uploaded successfully.")
+
+
 def run_update_tui(stdscr, args, update_runner):
     if update_runner is None:
         show_popup(stdscr, "Update", "Update is only available from the installed 3dsutil command.")
@@ -502,6 +597,7 @@ def tui_loop(stdscr, args=None, update_runner=None):
         options = [
             "NetLoader - load .3dsx via NetLoader",
             "FTP - browse and transfer files",
+            "FTP - download link to 3DS",
         ]
         update_index = None
         if getattr(args, "show_update", False):
@@ -511,7 +607,7 @@ def tui_loop(stdscr, args=None, update_runner=None):
 
         choice = menu_loop(
             stdscr,
-            "3dsutil v1.3",
+            "3dsutil v1.4",
             options,
             description=APP_OVERVIEW,
         )
@@ -521,6 +617,8 @@ def tui_loop(stdscr, args=None, update_runner=None):
             run_netloader_tui(stdscr)
         elif choice == 1:
             run_ftp_tui(stdscr)
+        elif choice == 2:
+            run_ftp_download_tui(stdscr)
         elif update_index is not None and choice == update_index:
             run_update_tui(stdscr, args, update_runner)
 

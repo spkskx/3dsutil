@@ -15,6 +15,7 @@ This repository is intentionally small. The main utility lives in `3dslink.py` a
 - `python3 3dslink.py ftp upload --host 172.20.10.12 --source first.nds --source second.gba --dest /roms/`: upload multiple sources in one FTP command.
 - `python3 3dslink.py ftp upload --host 172.20.10.12 --source roms.zip --dest /roms/ --unarchive --patterns "*.nds"`: extract one archive, or every archive in a directory source, to a temporary directory and upload matching extracted files into the destination root. If `--unarchive` is omitted and archives are found interactively, the prompt defaults to yes; answering no ignores archives and uploads the rest.
 - `python3 3dslink.py ftp status --host 172.20.10.12`: check whether ftpd is reachable and accepts login.
+- The TUI remembers only its last link-download destination in `${XDG_CONFIG_HOME:-~/.config}/3dsutil/config.json`; missing or invalid config falls back to `/roms/nds/`.
 - `python3 -m unittest discover -s tests -v`: run the full local test suite.
 
 There is no build step and no runtime dependency installation. Keep the project usable with the Python standard library unless a dependency is clearly justified.

@@ -12,6 +12,7 @@ import zipfile
 import zlib
 from unittest import mock
 
+import download as download_module
 import ftp as ftp_module
 import tui as tui_module
 
@@ -201,6 +202,67 @@ class ParseArgsTests(unittest.TestCase):
     def test_parse_args_rejects_invalid_status_port(self):
         with self.assertRaises(SystemExit):
             three_dsutil.parse_args(["netloader", "status", "--port", "70000"])
+
+
+class FetchArgsTests(unittest.TestCase):
+    def test_parse_args_accepts_ftp_fetch(self):
+        args = three_dsutil.parse_args([
+            "ftp", "fetch", "--url", "https://example.test/game.zip", "--name", "game.zip",
+            "--host", "192.168.0.10", "--dest", "/roms/nds/", "--unarchive", "--patterns", "*.nds",
+        ])
+
+        self.assertEqual(args.command, three_dsutil.FTP_COMMAND)
+        self.assertEqual(args.action, three_dsutil.FETCH_ACTION)
+        self.assertEqual(args.url, "https://example.test/game.zip")
+        self.assertEqual(args.name, "game.zip")
+        self.assertEqual(args.dest, "/roms/nds/")
+        self.assertTrue(args.unarchive)
+        self.assertEqual(args.patterns, ["*.nds"])
+
+
+class DownloadTests(unittest.TestCase):
+    def make_response(self, data, url):
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        response.__exit__.return_value = False
+        response.read = io.BytesIO(data).read
+        response.geturl.return_value = url
+        response.headers = {"Content-Length": str(len(data))}
+        return response
+
+    def test_download_url_streams_final_http_filename_to_destination(self):
+        response = self.make_response(b"payload", "https://cdn.example.test/roms/game.nds")
+        opener = mock.MagicMock()
+        opener.open.return_value = response
+
+        with tempfile.TemporaryDirectory() as temp_dir, \
+            mock.patch.object(download_module.urllib.request, "build_opener", return_value=opener):
+            path = three_dsutil.download_url("https://example.test/start", temp_dir, progress=lambda *_: None)
+            with open(path, "rb") as file_obj:
+                self.assertEqual(file_obj.read(), b"payload")
+
+        self.assertEqual(os.path.basename(path), "game.nds")
+        opener.open.assert_called_once()
+
+    def test_download_url_rejects_non_http_url(self):
+        with self.assertRaisesRegex(three_dsutil.FTPTransferError, "http"):
+            three_dsutil.download_url("file:///tmp/game.nds", "/tmp")
+
+    def test_download_url_rejects_unsafe_filename(self):
+        with self.assertRaisesRegex(three_dsutil.FTPTransferError, "safe filename"):
+            three_dsutil.download_filename("https://example.test/game.nds", "../game.nds")
+
+    def test_download_url_removes_partial_file_on_stream_failure(self):
+        response = self.make_response(b"", "https://example.test/game.nds")
+        response.read = mock.Mock(side_effect=[b"partial", OSError("connection dropped")])
+        opener = mock.MagicMock()
+        opener.open.return_value = response
+
+        with tempfile.TemporaryDirectory() as temp_dir, \
+            mock.patch.object(download_module.urllib.request, "build_opener", return_value=opener):
+            with self.assertRaisesRegex(three_dsutil.FTPTransferError, "download failed"):
+                three_dsutil.download_url("https://example.test/game.nds", temp_dir)
+            self.assertEqual(os.listdir(temp_dir), [])
 
 
 class ValidateInputFileTests(unittest.TestCase):
@@ -1400,6 +1462,16 @@ class ManagementCommandTests(unittest.TestCase):
 
 
 class MainTests(unittest.TestCase):
+    def test_main_runs_ftp_fetch_command(self):
+        args = argparse.Namespace(command=three_dsutil.FTP_COMMAND, action=three_dsutil.FETCH_ACTION, legacy=False)
+
+        with mock.patch.object(three_dsutil, "parse_args", return_value=args), \
+            mock.patch.object(three_dsutil, "run_ftp_fetch") as fetch_mock:
+            result = three_dsutil.main(["ftp", "fetch"])
+
+        self.assertEqual(result, 0)
+        fetch_mock.assert_called_once_with(args)
+
     def test_main_runs_tui_for_no_arguments(self):
         args = argparse.Namespace(command=three_dsutil.TUI_COMMAND, action=None, legacy=False)
 
@@ -1561,6 +1633,29 @@ class MainTests(unittest.TestCase):
         self.assertEqual(result, 0)
         update_mock.assert_called_once_with(args)
 
+    def test_run_ftp_fetch_downloads_to_temporary_source_then_reuses_upload(self):
+        args = argparse.Namespace(
+            url="https://example.test/game.nds",
+            name=None,
+            dest="/roms/nds/",
+            unarchive=False,
+            patterns=["*.nds"],
+            host="192.168.0.10",
+            port=5000,
+            user="anonymous",
+            password="",
+        )
+
+        with mock.patch.object(three_dsutil, "download_url", return_value="/tmp/game.nds") as download_mock, \
+            mock.patch.object(three_dsutil, "run_ftp") as run_ftp_mock:
+            three_dsutil.run_ftp_fetch(args)
+
+        download_mock.assert_called_once()
+        upload_args = run_ftp_mock.call_args.args[0]
+        self.assertEqual(upload_args.source, ["/tmp/game.nds"])
+        self.assertEqual(upload_args.dest, "/roms/nds/")
+        self.assertEqual(upload_args.patterns, ["*.nds"])
+
     def test_run_ftp_unarchives_before_uploading(self):
         args = argparse.Namespace(
             source=["archive.zip"],
@@ -1618,6 +1713,53 @@ class MainTests(unittest.TestCase):
             patterns=None,
             skip_archives=True,
         )
+
+
+class TuiDownloadLinkTests(unittest.TestCase):
+    def test_tui_download_destination_uses_default_for_missing_or_invalid_config(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = os.path.join(temp_dir, "config.json")
+            self.assertEqual(three_dsutil.load_tui_download_destination(config_path), "/roms/nds/")
+            with open(config_path, "w", encoding="utf-8") as file_obj:
+                file_obj.write("not json")
+            self.assertEqual(three_dsutil.load_tui_download_destination(config_path), "/roms/nds/")
+
+    def test_tui_download_destination_saves_and_loads_last_path(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = os.path.join(temp_dir, "3dsutil", "config.json")
+            three_dsutil.save_tui_download_destination("/roms/dsi/", config_path)
+
+            self.assertEqual(three_dsutil.load_tui_download_destination(config_path), "/roms/dsi/")
+
+    def test_tui_download_link_uploads_to_chosen_destination_and_remembers_it(self):
+        with mock.patch.object(tui_module, "draw_menu"), \
+            mock.patch.object(tui_module, "prompt_tui_target", return_value=(("192.168.0.10", 5000), "")), \
+            mock.patch.object(tui_module, "prompt_text", side_effect=["https://example.test/game.nds", "/roms/dsi"]), \
+            mock.patch.object(tui_module, "show_popup"), \
+            mock.patch.object(tui_module, "download_url", return_value="/tmp/game.nds"), \
+            mock.patch.object(tui_module, "has_archive_sources", return_value=False), \
+            mock.patch.object(tui_module, "send_ftp") as send_mock, \
+            mock.patch.object(tui_module, "save_tui_download_destination") as save_mock:
+            tui_module.run_ftp_download_tui(mock.MagicMock())
+
+        send_mock.assert_called_once_with("192.168.0.10", 5000, "/tmp/game.nds", "/roms/dsi/", "anonymous", "", skip_archives=False)
+        save_mock.assert_called_once_with("/roms/dsi/")
+
+    def test_tui_download_link_unarchives_when_selected(self):
+        with mock.patch.object(tui_module, "draw_menu"), \
+            mock.patch.object(tui_module, "prompt_tui_target", return_value=(("192.168.0.10", 5000), "")), \
+            mock.patch.object(tui_module, "prompt_text", side_effect=["https://example.test/game.zip", "/roms/nds/"]), \
+            mock.patch.object(tui_module, "show_popup"), \
+            mock.patch.object(tui_module, "download_url", return_value="/tmp/game.zip"), \
+            mock.patch.object(tui_module, "has_archive_sources", return_value=True), \
+            mock.patch.object(tui_module, "prompt_archive_transfer_action", return_value=three_dsutil.FTP_ARCHIVE_UNARCHIVE), \
+            mock.patch.object(tui_module, "unarchive_ftp_sources", return_value="/tmp/extracted") as unarchive_mock, \
+            mock.patch.object(tui_module, "send_ftp") as send_mock, \
+            mock.patch.object(tui_module, "save_tui_download_destination"):
+            tui_module.run_ftp_download_tui(mock.MagicMock())
+
+        unarchive_mock.assert_called_once()
+        send_mock.assert_called_once_with("192.168.0.10", 5000, "/tmp/extracted", "/roms/nds/", "anonymous", "", skip_archives=False)
 
 
 if __name__ == "__main__":

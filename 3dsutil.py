@@ -12,6 +12,7 @@ from core import (
     DISCOVERY_REQUEST,
     DISCOVERY_RESPONSE_PREFIX,
     EXPLORER_ACTION,
+    FETCH_ACTION,
     FTP_ARCHIVE_SKIP,
     FTP_ARCHIVE_UNARCHIVE,
     FTP_COMMAND,
@@ -32,6 +33,7 @@ from core import (
 )
 from netloader import *
 from ftp import *
+from download import *
 from tui import *
 
 
@@ -119,8 +121,7 @@ def add_netloader_arguments(parser):
     )
 
 
-def add_ftp_arguments(parser):
-    parser.add_argument("--source", action="append", required=True, help="Local file or directory to upload. Repeat for multiple sources")
+def add_ftp_transfer_arguments(parser):
     parser.add_argument("--dest", required=True, help="Remote destination file or directory path")
     parser.add_argument(
         "--unarchive",
@@ -133,6 +134,17 @@ def add_ftp_arguments(parser):
         help="Upload only files matching a shell-style pattern, such as '*.nds' or '*.gba'. Repeat for multiple patterns.",
     )
     add_ftp_connection_arguments(parser)
+
+
+def add_ftp_arguments(parser):
+    parser.add_argument("--source", action="append", required=True, help="Local file or directory to upload. Repeat for multiple sources")
+    add_ftp_transfer_arguments(parser)
+
+
+def add_ftp_fetch_arguments(parser):
+    parser.add_argument("--url", required=True, help="Direct http:// or https:// URL to download")
+    parser.add_argument("--name", help="Filename to use when the URL has no usable filename")
+    add_ftp_transfer_arguments(parser)
 
 
 def add_netloader_status_arguments(parser):
@@ -298,6 +310,16 @@ def parse_args(argv):
             "3dsutil ftp upload",
         )
 
+    if len(argv) >= 2 and argv[0] == FTP_COMMAND and argv[1] == FETCH_ACTION:
+        return parse_action_args(
+            argv[2:],
+            FTP_COMMAND,
+            FETCH_ACTION,
+            add_ftp_fetch_arguments,
+            "Download one HTTP(S) URL and upload it through FTP.",
+            "3dsutil ftp fetch",
+        )
+
     if len(argv) >= 2 and argv[0] == FTP_COMMAND and argv[1] == EXPLORER_ACTION:
         return parse_action_args(
             argv[2:],
@@ -444,6 +466,22 @@ def run_ftp(args):
     )
 
 
+def run_ftp_fetch(args):
+    with tempfile.TemporaryDirectory(prefix="3dsutil-fetch-") as temp_dir:
+        source = download_url(args.url, temp_dir, name=args.name)
+        upload_args = argparse.Namespace(
+            source=[source],
+            dest=args.dest,
+            unarchive=args.unarchive,
+            patterns=args.patterns,
+            host=args.host,
+            port=args.port,
+            user=args.user,
+            password=args.password,
+        )
+        run_ftp(upload_args)
+
+
 def run_status(args):
     if args.command == FTP_COMMAND:
         host, port = resolve_ftp_host(args.host, args.port)
@@ -586,6 +624,8 @@ def main(argv=None):
             run_tui(args, update_runner=run_update)
         elif args.command == FTP_COMMAND and args.action == EXPLORER_ACTION:
             run_ftp_explorer(args)
+        elif args.command == FTP_COMMAND and args.action == FETCH_ACTION:
+            run_ftp_fetch(args)
         elif args.command == FTP_COMMAND:
             run_ftp(args)
         else:
